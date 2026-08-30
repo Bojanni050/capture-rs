@@ -60,8 +60,9 @@ impl Default for UiaConfig {
         Self {
             enabled: true,
             // Event-driven modus: alleen lezen wanneer de app meldt dat er iets veranderd is.
-            // Dit is architectonisch beter maar vereist dat apps events sturen.
-            event_driven: false,
+            // Dit is architectonisch beter: geen polling, alleen lezen bij veranderingen.
+            // Apps die geen events sturen vallen terug op de traditionele methode.
+            event_driven: true,
             // Hoger dan de OCR-drempel: een boom die alleen "Bestand" en "OK"
             // oplevert is geen inhoud, en dan wil je alsnog OCR proberen.
             // Chromium-browsers schakelen accessibility geleidelijk in, dus de
