@@ -154,6 +154,14 @@ impl UiaService {
         if let Some(reason) = self.matching_event(hwnd) {
             tracing::trace!(app = app_key, soort = reason, "uia-event ontvangen");
         }
+        // Goedkope controle, elke tik: zit de eventthread vast in een
+        // registratie bij een provider zonder deadline? Verandert niets aan
+        // de leesactie hieronder — die loopt sowieso altijd via de
+        // toegewijde, beveiligde werkthread — maar zonder dit zou een
+        // vastgelopen eventthread onzichtbaar zijn.
+        if let Some(manager) = &self.event_manager {
+            manager.warn_if_stuck(app_key);
+        }
 
         self.read_via_worker(app_key, hwnd).await
     }

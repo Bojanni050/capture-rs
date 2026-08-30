@@ -23,7 +23,10 @@
 //! (events eruit).
 
 use anyhow::{Context, Result, anyhow};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, SAFEARRAY,
@@ -57,6 +60,50 @@ pub enum UiaEvent {
         hwnd: isize,
         property_id: UIA_PROPERTY_ID,
     },
+}
+
+/// Bewaakt of de STA-thread vastzit in `ElementFromHandle` of
+/// `AddStructureChangedEventHandler`/`AddPropertyChangedEventHandlerNativeArray`
+/// — de enige twee aanroepen op die thread die geen deadline hebben en op een
+/// vastgelopen provider kunnen blijven hangen.
+///
+/// `0` betekent "niet bezig"; anders millis sinds `UNIX_EPOCH` waarop de
+/// huidige registratie begon. Een `Arc<AtomicU64>` in plaats van een `Mutex`
+/// omdat de schrijver (de STA-thread) en de lezers (`Drop`, de watchdog in
+/// `read()`) nooit op elkaar hoeven te wachten — verstale of net-bijgewerkte
+/// waarde lezen is hier prima, dit is geen correctheidskritisch getal.
+#[derive(Clone)]
+struct BusySince(Arc<AtomicU64>);
+
+impl BusySince {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
+    }
+
+    fn enter(&self) {
+        self.0.store(now_millis(), Ordering::Relaxed);
+    }
+
+    fn exit(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+
+    /// Hoe lang de thread al onafgebroken in één registratie zit, of `None`
+    /// als hij momenteel niets aan het registreren is.
+    fn stuck_for(&self) -> Option<Duration> {
+        let started = self.0.load(Ordering::Relaxed);
+        if started == 0 {
+            return None;
+        }
+        Some(Duration::from_millis(now_millis().saturating_sub(started)))
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -124,10 +171,29 @@ struct ThreadState {
     event_sender: Sender<UiaEvent>,
     structure_handlers: std::collections::HashMap<isize, IUIAutomationStructureChangedEventHandler>,
     property_handlers: std::collections::HashMap<isize, IUIAutomationPropertyChangedEventHandler>,
+    busy: BusySince,
+}
+
+/// Markeert de thread als bezig zolang dit leeft, ongeacht of de aanroep
+/// eindigt via succes, een `?`-foutretour, of een paniek.
+struct BusyGuard<'a>(&'a BusySince);
+
+impl<'a> BusyGuard<'a> {
+    fn new(busy: &'a BusySince) -> Self {
+        busy.enter();
+        Self(busy)
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.exit();
+    }
 }
 
 impl ThreadState {
     fn register(&mut self, hwnd: HWND) -> Result<()> {
+        let _busy = BusyGuard::new(&self.busy);
         let hwnd_val = hwnd.0 as isize;
         let root = unsafe { self.automation.ElementFromHandle(hwnd) }
             .context("venster heeft geen accessibility-element")?;
@@ -167,6 +233,7 @@ impl ThreadState {
     }
 
     fn unregister(&mut self, hwnd: HWND) {
+        let _busy = BusyGuard::new(&self.busy);
         let hwnd_val = hwnd.0 as isize;
         let Ok(root) = (unsafe { self.automation.ElementFromHandle(hwnd) }) else {
             // Venster is al weg; de registratie is dan sowieso al waardeloos.
@@ -274,7 +341,7 @@ fn state_from<'a>(hwnd: HWND) -> Option<&'a mut ThreadState> {
 
 /// Draait op de toegewijde thread: COM als STA initialiseren, het venster
 /// aanmaken, en dan de message-loop pompen tot `WM_UIA_SHUTDOWN`.
-fn run(event_sender: Sender<UiaEvent>, ready: std::sync::mpsc::Sender<Result<isize>>) {
+fn run(event_sender: Sender<UiaEvent>, busy: BusySince, ready: std::sync::mpsc::Sender<Result<isize>>) {
     let outcome = (|| -> Result<HWND> {
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED)
@@ -302,6 +369,7 @@ fn run(event_sender: Sender<UiaEvent>, ready: std::sync::mpsc::Sender<Result<isi
             event_sender,
             structure_handlers: std::collections::HashMap::new(),
             property_handlers: std::collections::HashMap::new(),
+            busy,
         });
         let state_ptr = Box::into_raw(state);
 
@@ -376,21 +444,35 @@ fn run(event_sender: Sender<UiaEvent>, ready: std::sync::mpsc::Sender<Result<isi
     }
 }
 
+/// Hoeveel tijd `register`/`unregister` krijgt voordat de watchdog ze als
+/// vastgelopen beschouwt. Ruim boven de 200–2500 ms die we voor een volledige
+/// boomlezing gemeten hebben (`reader.rs`) — deze twee doen veel minder werk
+/// (geen boomwandeling), dus dit is al een royale marge.
+const STUCK_THRESHOLD: Duration = Duration::from_secs(5);
+/// Hoe lang `Drop` op een nette afsluiting wacht voordat hij de thread
+/// loslaat in plaats van het afsluiten van het hele proces te laten hangen.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Handvat voor de STA-eventthread. `register_window_events` en
 /// `unregister_window_events` posten alleen een bericht — de daadwerkelijke
 /// COM-aanroepen gebeuren op de eventthread zelf, nooit hier.
 pub struct UiaEventThread {
     hwnd: isize,
+    busy: BusySince,
+    /// Voorkomt dat een vastgelopen thread bij elke tik opnieuw gelogd wordt.
+    warned_stuck: std::sync::atomic::AtomicBool,
     join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl UiaEventThread {
     pub fn start(event_sender: Sender<UiaEvent>) -> Result<Self> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<isize>>();
+        let busy = BusySince::new();
+        let busy_for_thread = busy.clone();
 
         let join_handle = std::thread::Builder::new()
             .name("chronicle-uia-events".into())
-            .spawn(move || run(event_sender, ready_tx))
+            .spawn(move || run(event_sender, busy_for_thread, ready_tx))
             .context("uia-events thread starten mislukt")?;
 
         let hwnd = ready_rx
@@ -399,6 +481,8 @@ impl UiaEventThread {
 
         Ok(Self {
             hwnd,
+            busy,
+            warned_stuck: std::sync::atomic::AtomicBool::new(false),
             join_handle: Some(join_handle),
         })
     }
@@ -409,6 +493,29 @@ impl UiaEventThread {
 
     pub fn unregister_window_events(&self, hwnd: HWND) -> Result<()> {
         self.post(WM_UIA_UNREGISTER, hwnd)
+    }
+
+    /// Meldt eenmalig — niet bij elke tik opnieuw — of de eventthread al
+    /// langer dan `STUCK_THRESHOLD` in één registratie vastzit. `PostMessageW`
+    /// blijft daarna gewoon werken (die blokkeert nooit op een volle
+    /// wachtrij bij dit soort volumes); dit is puur zichtbaarheid voor een
+    /// situatie die anders geruisloos verdwijnt in "er komen geen events
+    /// meer" zonder dat iets zegt waarom.
+    pub fn warn_if_stuck(&self, app_key: &str) {
+        match self.busy.stuck_for() {
+            Some(elapsed) if elapsed >= STUCK_THRESHOLD => {
+                if !self.warned_stuck.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        app = app_key,
+                        seconden = elapsed.as_secs(),
+                        "uia-eventthread zit vast in een registratie bij een provider; \
+                         events blijven uit, polling werkt gewoon door"
+                    );
+                }
+            }
+            Some(_) => {}
+            None => self.warned_stuck.store(false, Ordering::Relaxed),
+        }
     }
 
     fn post(&self, msg: u32, hwnd: HWND) -> Result<()> {
@@ -424,9 +531,30 @@ impl Drop for UiaEventThread {
         unsafe {
             let _ = PostMessageW(Some(target), WM_UIA_SHUTDOWN, WPARAM(0), LPARAM(0));
         }
-        if let Some(handle) = self.join_handle.take() {
+
+        let Some(handle) = self.join_handle.take() else {
+            return;
+        };
+        // Zat de thread al vast in een providerloze COM-aanroep, dan ligt het
+        // shutdown-bericht achter in de wachtrij te wachten tot die aanroep
+        // — die geen deadline heeft — ooit teruggeeft. Het afsluiten van het
+        // hele proces mag daar nooit op wachten, dus `join()` gebeurt op een
+        // eigen thread en we geven het een ruime marge; loopt die af, dan
+        // laten we de thread los in plaats van te blijven hangen.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let _joiner = std::thread::spawn(move || {
             let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        if done_rx.recv_timeout(SHUTDOWN_GRACE).is_err() {
+            tracing::warn!(
+                seconden = SHUTDOWN_GRACE.as_secs(),
+                "uia-eventthread reageerde niet op afsluiten; losgelaten"
+            );
         }
+        // `_joiner` laten we bewust los: die rondt vanzelf af zodra de
+        // onderliggende thread dat doet, of nooit — dat blokkeert in geen van
+        // beide gevallen het proces dat nu al aan het afsluiten is.
     }
 }
 
@@ -459,5 +587,58 @@ mod tests {
             })
             .unwrap();
         assert!(receiver.try_recv().is_ok());
+    }
+
+    // Deze vier testen de horlogelogica zonder COM of een echte thread nodig
+    // te hebben — precies het deel dat we niet betrouwbaar kunnen bewijzen
+    // door een echte provider te laten vasthangen.
+
+    #[test]
+    fn busysince_begint_leeg() {
+        assert_eq!(BusySince::new().stuck_for(), None);
+    }
+
+    #[test]
+    fn busysince_rapporteert_bezig_na_enter() {
+        let busy = BusySince::new();
+        busy.enter();
+        let elapsed = busy.stuck_for().expect("moet bezig zijn na enter()");
+        assert!(elapsed < Duration::from_secs(1), "was {elapsed:?}");
+    }
+
+    #[test]
+    fn busysince_is_weer_leeg_na_exit() {
+        let busy = BusySince::new();
+        busy.enter();
+        busy.exit();
+        assert_eq!(busy.stuck_for(), None);
+    }
+
+    #[test]
+    fn busyguard_ruimt_op_bij_normale_return_en_bij_paniek() {
+        let busy = BusySince::new();
+
+        {
+            let _guard = BusyGuard::new(&busy);
+            assert!(busy.stuck_for().is_some(), "guard moet enter() aanroepen");
+        }
+        assert_eq!(
+            busy.stuck_for(),
+            None,
+            "guard moet exit() aanroepen bij normale drop"
+        );
+
+        let busy2 = BusySince::new();
+        let busy2_ref = &busy2;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = BusyGuard::new(busy2_ref);
+            panic!("gesimuleerde vastgelopen COM-aanroep");
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            busy2.stuck_for(),
+            None,
+            "guard moet ook opruimen als de aanroep paniekt"
+        );
     }
 }
