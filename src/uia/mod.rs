@@ -108,18 +108,16 @@ impl UiaService {
 
         // Start event-driven UIA als dat ingeschakeld is
         let (event_manager, event_receiver, event_thread) = if cfg.event_driven {
-            ensure_mta()?;
             let (event_sender, event_receiver) = std_mpsc::channel();
-            let max_elements = cfg.max_elements;
-
+            
             // Creer een UiaReader om de automation en cache te delen
-            let reader = UiaReader::new(max_elements)?;
+            let reader = UiaReader::new(cfg.max_elements)?;
 
             let manager = UiaEventManager::new(
                 reader.automation.clone(),
                 reader.cache.clone(),
                 event_sender.clone(),
-            );
+            )?;
             let manager_arc = Arc::new(manager);
             let thread = start_event_thread(event_sender)?;
             (Some(manager_arc), Some(event_receiver), Some(thread))
@@ -157,9 +155,9 @@ impl UiaService {
                         // Er is een structurele verandering, lees de boom nu
                         return self.read_after_event(app_key, hwnd).await;
                     }
-                    UiaEvent::PropertyChanged { hwnd: event_hwnd, property_id } if event_hwnd == hwnd => {
+                    UiaEvent::PropertyChanged { hwnd: event_hwnd, .. } if event_hwnd == hwnd => {
                         // Er is een property verandering, lees de boom nu
-                        tracing::debug!(app = app_key, property = property_id.0, "UIA property veranderd");
+                        tracing::debug!(app = app_key, "UIA property veranderd");
                         return self.read_after_event(app_key, hwnd).await;
                     }
                     _ => {

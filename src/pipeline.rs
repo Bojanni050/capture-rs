@@ -224,6 +224,19 @@ impl Pipeline {
         let shots = block_in_place(|| self.capturer.capture())?;
         tracing::trace!(frames = shots.len(), "screenshot klaar");
 
+        // Als event-driven UIA ingeschakeld is, registreer dan event handlers
+        // voor het voorgrondvenster
+        if let Some(ref mut uia_service) = self.uia {
+            if uia_service.cfg.event_driven {
+                if let Some(ref manager) = uia_service.event_manager {
+                    let hwnd_obj = HWND(window.hwnd as *mut core::ffi::c_void);
+                    if let Err(e) = manager.register_window_events(hwnd_obj) {
+                        tracing::debug!(app = app_key, error = %e, "UIA event registratie mislukt");
+                    }
+                }
+            }
+        }
+
         for shot in shots {
             self.process_frame(
                 FrameContext {
