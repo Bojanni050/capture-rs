@@ -19,7 +19,7 @@
 //!    ontwerptool), dan bewaren we het frame zelf, zodat er nooit een gat in
 //!    je tijdlijn valt.
 
-use crate::capture::{ScreenCapturer, WindowInfo, foreground, idle_seconds};
+use crate::capture::{ForegroundEvents, ScreenCapturer, WindowInfo, foreground, idle_seconds};
 use crate::config::{Config, FramePolicy};
 use crate::filter::{dedupe, Gate, NoiseFilter};
 use crate::ocr::OcrService;
@@ -37,6 +37,9 @@ use tokio::task::block_in_place;
 const FLUSH_EVERY: u64 = 50;
 /// Hoe vaak de retentie-opruiming draait.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3_600);
+/// Geeft een nieuw voorgrondvenster even de tijd om zijn titel/UIA-boom bij te
+/// werken en voorkomt captures tijdens een snelle Alt-Tab-reeks.
+const FOREGROUND_DEBOUNCE: Duration = Duration::from_millis(500);
 
 struct Segment {
     id: i64,
@@ -156,6 +159,21 @@ impl Pipeline {
     pub async fn run(&mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
         let mut maintenance = tokio::time::interval(MAINTENANCE_INTERVAL);
         maintenance.tick().await; // de eerste tik komt meteen; die slaan we over
+        let (foreground_events, mut foreground_changes) = match ForegroundEvents::start() {
+            Ok(events) => {
+                tracing::info!("voorgrondvenster-events actief");
+                (Some(events.0), events.1)
+            }
+            Err(e) => {
+                // De periodieke route blijft volledig bruikbaar wanneer een
+                // sandbox of oude Windows-versie geen hook toestaat.
+                tracing::warn!(error = %e, "voorgrondvenster-events niet beschikbaar; alleen interval actief");
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                // Houd geen hook vast; de receiver sluit nooit en de
+                // fallback-timer blijft de opname aansturen.
+                (None, rx)
+            }
+        };
 
         loop {
             let idle = idle_seconds();
@@ -184,9 +202,17 @@ impl Pipeline {
                         break;
                     }
                 }
+                Some(_) = foreground_changes.recv() => {
+                    // Windows kan bij één overgang meerdere meldingen geven.
+                    // De inhoud en titel hebben bovendien een kort moment
+                    // nodig om stabiel te worden.
+                    tokio::time::sleep(FOREGROUND_DEBOUNCE).await;
+                    while foreground_changes.try_recv().is_ok() {}
+                }
             }
         }
 
+        drop(foreground_events);
         self.flush_boilerplate()?;
         tracing::info!("opname gestopt");
         Ok(())

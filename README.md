@@ -5,9 +5,11 @@ Houdt bij wat je op je pc doet — in Rust, lokaal, zonder cloud. Geïnspireerd 
 Windows en met een ruisfilter dat serieus werk doet in plaats van alles te
 bewaren.
 
-Elke paar seconden: kijken welk venster actief is, de tekst uitlezen, de ruis
-eruit filteren, en het resultaat doorzoekbaar opslaan. Dat uitlezen gebeurt via
-drie bronnen, in volgorde van betrouwbaarheid:
+Bij een wissel van voorgrondvenster reageert Chronicle direct (na een korte
+debounce); daarnaast blijft er een periodieke controle als vangnet voor video,
+canvas-apps en andere inhoud zonder Windows-events. Daarna leest het de tekst
+uit, filtert ruis en slaat het resultaat doorzoekbaar op. Dat uitlezen gebeurt
+via drie bronnen, in volgorde van betrouwbaarheid:
 
 1. **UI Automation** — de tekens die de app zelf aan schermlezers geeft. Exact,
    geen leesfouten.
