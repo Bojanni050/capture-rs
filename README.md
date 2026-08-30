@@ -183,6 +183,12 @@ retention_days = 45        # alles ouder dan dit verdwijnt
 frame_retention_days = 10  # afbeeldingen eerder, tekst blijft langer
 ```
 
+Bij `monitor = "all"` behandelt Chronicle elk scherm als een eigen bron: elk
+frame krijgt eerst zijn eigen beeldhash en tekstvergelijking. UI Automation
+beschrijft alleen het voorgrondvenster en wordt daarom alleen gebruikt wanneer
+één monitor is geselecteerd; bij een multischerm-opname leest OCR de schermen
+apart. Zo kan tekst op één scherm een tweede scherm niet wegfilteren.
+
 Retentie draait automatisch elk uur terwijl `start` loopt.
 
 ## API

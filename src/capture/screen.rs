@@ -64,6 +64,13 @@ impl ScreenCapturer {
         names.join(", ")
     }
 
+    /// Of de huidige selectie precies één scherm bevat. De pipeline gebruikt
+    /// dit om te bepalen of UIA veilig als tekstbron voor een frame kan dienen:
+    /// UIA beschrijft alleen het voorgrondvenster, niet een tweede monitor.
+    pub fn is_single_monitor(&self) -> bool {
+        self.selected().len() == 1
+    }
+
     fn selected(&self) -> Vec<&Monitor> {
         match self.selector {
             MonitorSelector::All => self.monitors.iter().collect(),
