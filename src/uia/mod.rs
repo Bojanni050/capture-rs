@@ -14,10 +14,14 @@
 //!    UIA-poging verspilling, dus we onthouden per app of het wat oplevert en
 //!    zetten hem tijdelijk uit als het een paar keer niks werd.
 //!
-//! 3. **Event-driven modus.** Als `event_driven` ingeschakeld is, gebruiken we
-//!    AddStructureChangedEventHandler en AddPropertyChangedEventHandler om de
-//!    boom alleen uit te lezen wanneer de app zelf meldt dat er iets veranderd is.
-//!    Dit is architectonisch beter: geen polling, alleen lezen bij veranderingen.
+//! 3. **Events als signaal, niet als kortere weg.** Als `event_driven`
+//!    ingeschakeld is, registreren we AddStructureChangedEventHandler en
+//!    AddPropertyChangedEventHandler op het voorgrondvenster. Een event zegt
+//!    alleen dát er iets veranderd is; de tik-lus blijft de screenshots en de
+//!    leescadans bepalen, en elke lezing — event of niet — gaat via dezelfde
+//!    `read_via_worker`: toegewijde thread, altijd met een deadline. Een
+//!    eerdere versie liet de event-tak rechtstreeks en zonder deadline lezen;
+//!    dat was precies het gevaar waar punt 1 hierboven voor waarschuwt.
 
 pub mod events;
 pub mod reader;
@@ -30,7 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 use windows::Win32::Foundation::HWND;
 
 use crate::config::UiaConfig;
-use events::{UiaEvent, UiaEventManager, start_event_thread};
+use events::{UiaEvent, UiaEventThread};
 use reader::{UiaReader, WindowRead};
 
 struct Job {
@@ -62,13 +66,11 @@ pub struct UiaService {
     pub(crate) cfg: UiaConfig,
     health: HashMap<String, AppHealth>,
     denylist: Vec<String>,
-    /// Event manager voor event-driven UIA lezen.
-    pub(crate) event_manager: Option<UiaEventManager>,
+    /// STA-thread die UIA-events registreert en ontvangt. Sluit zichzelf
+    /// netjes af zodra dit veld valt (`UiaEventThread::drop`).
+    pub(crate) event_manager: Option<UiaEventThread>,
     /// Ontvanger voor UIA events.
     event_receiver: Option<std_mpsc::Receiver<UiaEvent>>,
-    /// Thread handle voor de event processing thread.
-    #[allow(dead_code)]
-    event_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl UiaService {
@@ -106,22 +108,21 @@ impl UiaService {
 
         let denylist = cfg.app_denylist.iter().map(|a| a.to_lowercase()).collect();
 
-        // Start event-driven UIA als dat ingeschakeld is
-        let (event_manager, event_receiver, event_thread) = if cfg.event_driven {
+        // Start event-driven UIA als dat ingeschakeld is. De STA-thread bouwt
+        // zijn eigen IUIAutomation-instantie op — COM-objecten zijn
+        // apartment-gebonden en kunnen niet gedeeld worden met de MTA-thread
+        // hierboven, ook niet via clone().
+        let (event_manager, event_receiver) = if cfg.event_driven {
             let (event_sender, event_receiver) = std_mpsc::channel();
-
-            // Creer een UiaReader om de automation en cache te delen
-            let reader = UiaReader::new(cfg.max_elements)?;
-
-            let manager = UiaEventManager::new(
-                reader.automation.clone(),
-                reader.cache.clone(),
-                event_sender.clone(),
-            )?;
-            let thread = start_event_thread(event_sender)?;
-            (Some(manager), Some(event_receiver), Some(thread))
+            match UiaEventThread::start(event_sender) {
+                Ok(thread) => (Some(thread), Some(event_receiver)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "uia-eventthread niet beschikbaar; alleen polling");
+                    (None, None)
+                }
+            }
         } else {
-            (None, None, None)
+            (None, None)
         };
 
         Ok(Self {
@@ -131,7 +132,6 @@ impl UiaService {
             denylist,
             event_manager,
             event_receiver,
-            event_thread,
         })
     }
 
@@ -145,28 +145,37 @@ impl UiaService {
             return Outcome::Unavailable("uia levert niets voor deze app");
         }
 
-        // Als event-driven UIA ingeschakeld is, check dan of er events zijn
-        if let Some(ref event_receiver) = self.event_receiver {
-            // Check of er een event is voor dit venster
-            if let Ok(event) = event_receiver.try_recv() {
-                match event {
-                    UiaEvent::StructureChanged { hwnd: event_hwnd, .. } if event_hwnd == hwnd => {
-                        // Er is een structurele verandering, lees de boom nu
-                        return self.read_after_event(app_key, hwnd).await;
-                    }
-                    UiaEvent::PropertyChanged { hwnd: event_hwnd, .. } if event_hwnd == hwnd => {
-                        // Er is een property verandering, lees de boom nu
-                        tracing::debug!(app = app_key, "UIA property veranderd");
-                        return self.read_after_event(app_key, hwnd).await;
-                    }
-                    _ => {
-                        // Event is voor een ander venster, doe niets
-                    }
-                }
-            }
+        // Een event vertelt ons alleen dát er iets veranderd is; het mag
+        // nooit een reden zijn om de leesactie zelf anders uit te voeren.
+        // Vóór deze fix deed de event-tak een eigen synchrone COM-aanroep
+        // (nieuwe UiaReader, geen deadline, niet van de tokio-runtime af)
+        // — precies het gevaar waar de rest van dit bestand tegen
+        // beveiligt. Nu komen beide routes samen in `read_via_worker`.
+        if let Some(reason) = self.matching_event(hwnd) {
+            tracing::trace!(app = app_key, soort = reason, "uia-event ontvangen");
         }
 
-        // Normale leesactie als er geen event is
+        self.read_via_worker(app_key, hwnd).await
+    }
+
+    /// Haalt hoogstens één in de wachtrij staand event op dat bij `hwnd`
+    /// hoort. Events voor een ander venster, en een eventuele rest na de
+    /// eerste match, blijven gewoon staan voor een volgende tik — ze zijn
+    /// puur signalerend en sturen niets buiten `read_via_worker` om aan.
+    fn matching_event(&self, hwnd: isize) -> Option<&'static str> {
+        let event_receiver = self.event_receiver.as_ref()?;
+        match event_receiver.try_recv() {
+            Ok(UiaEvent::StructureChanged { hwnd: h, .. }) if h == hwnd => Some("structuur"),
+            Ok(UiaEvent::PropertyChanged { hwnd: h, .. }) if h == hwnd => Some("property"),
+            _ => None,
+        }
+    }
+
+    /// De enige plek waar UIA daadwerkelijk gelezen wordt: altijd via de
+    /// toegewijde werkthread, altijd met een deadline. Zowel de normale
+    /// route als de event-route komen hier samen, zodat er geen tweede,
+    /// onbeveiligd leespad kan ontstaan.
+    async fn read_via_worker(&mut self, app_key: &str, hwnd: isize) -> Outcome {
         let (reply, rx) = oneshot::channel();
         // Bezet? Dan hangt de vorige aanroep nog; niet wachten.
         if self.tx.try_send(Job { hwnd, reply }).is_err() {
@@ -200,34 +209,6 @@ impl UiaService {
 
         self.record_success(app_key);
         Outcome::Text(read.lines)
-    }
-
-    /// Lees de boom na een event (event-driven modus).
-    async fn read_after_event(&mut self, app_key: &str, hwnd: isize) -> Outcome {
-        if let Some(ref manager) = self.event_manager {
-            let hwnd_obj = HWND(hwnd as *mut core::ffi::c_void);
-
-            // Lees direct de boom na het event
-            match manager.read_window_after_event(hwnd_obj) {
-                Ok(read) => {
-                    if read.chars() >= self.cfg.min_text_len {
-                        self.record_success(app_key);
-                        return Outcome::Text(read.lines);
-                    } else {
-                        self.record_failure(app_key);
-                        return Outcome::Unavailable("uia gaf te weinig tekst na event");
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(app = app_key, error = %e, "uia-lezen na event mislukt");
-                    self.record_failure(app_key);
-                    return Outcome::Unavailable("uia-fout na event");
-                }
-            }
-        }
-
-        // Als event-driven niet beschikbaar is, gebruik de normale methode
-        Outcome::Unavailable("event-driven uia niet beschikbaar")
     }
 
     fn is_denied(&self, app_key: &str) -> bool {
@@ -286,7 +267,6 @@ mod tests {
             denylist,
             event_manager: None,
             event_receiver: None,
-            event_thread: None,
         }
     }
 
