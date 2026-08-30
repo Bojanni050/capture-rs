@@ -59,10 +59,10 @@ impl Default for UiaConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // Event-driven modus: alleen lezen wanneer de app meldt dat er iets veranderd is.
-            // Dit is architectonisch beter: geen polling, alleen lezen bij veranderingen.
-            // Apps die geen events sturen vallen terug op de traditionele methode.
-            event_driven: true,
+            // Event-driven is nu een stub (zie src/uia/events.rs) — alleen
+            // bookkeeping, geen echte COM handlers. Default uit tot de
+            // implementatie met #[implement(IUIAutomation...Handler)] af is.
+            event_driven: false,
             // Hoger dan de OCR-drempel: een boom die alleen "Bestand" en "OK"
             // oplevert is geen inhoud, en dan wil je alsnog OCR proberen.
             // Chromium-browsers schakelen accessibility geleidelijk in, dus de
@@ -244,13 +244,60 @@ impl Config {
             None => Self::default_path()?,
         };
         if !path.exists() {
-            return Ok((Self::default(), path));
+            let cfg = Self::default();
+            cfg.validate()?;
+            return Ok((cfg, path));
         }
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("config lezen mislukt: {}", path.display()))?;
         let cfg: Self = toml::from_str(&raw)
             .with_context(|| format!("config parsen mislukt: {}", path.display()))?;
+        cfg.validate()?;
         Ok((cfg, path))
+    }
+
+    /// Controleert bereiken; voorkomt dat een tikfout je capture stillegt.
+    pub fn validate(&self) -> Result<()> {
+        use anyhow::anyhow;
+        if self.capture.interval_secs < 0.1 || self.capture.interval_secs > 3600.0 {
+            return Err(anyhow!(
+                "capture.interval_secs moet tussen 0.1 en 3600 liggen (gevonden {})",
+                self.capture.interval_secs
+            ));
+        }
+        if self.capture.idle_interval_secs < 0.0 || self.capture.idle_interval_secs > 3600.0 {
+            return Err(anyhow!(
+                "capture.idle_interval_secs moet tussen 0 en 3600 liggen"
+            ));
+        }
+        if self.filter.phash_threshold > 64 {
+            return Err(anyhow!(
+                "filter.phash_threshold moet 0..64 zijn (gevonden {})",
+                self.filter.phash_threshold
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.filter.text_similarity) {
+            return Err(anyhow!("filter.text_similarity moet 0..1 zijn"));
+        }
+        if !(0.0..=1.0).contains(&self.filter.boilerplate_ratio) {
+            return Err(anyhow!("filter.boilerplate_ratio moet 0..1 zijn"));
+        }
+        if self.ocr.min_quality < 0.0 || self.ocr.min_quality > 1.0 {
+            return Err(anyhow!("ocr.min_quality moet 0..1 zijn"));
+        }
+        if !(1..=100).contains(&self.storage.frame_quality) {
+            return Err(anyhow!(
+                "storage.frame_quality moet 1..100 zijn (gevonden {})",
+                self.storage.frame_quality
+            ));
+        }
+        if self.uia.max_elements < 50 || self.uia.max_elements > 20_000 {
+            return Err(anyhow!("uia.max_elements moet 50..20000 zijn"));
+        }
+        if self.uia.timeout_ms == 0 || self.uia.timeout_ms > 30_000 {
+            return Err(anyhow!("uia.timeout_ms moet 1..30000 zijn"));
+        }
+        Ok(())
     }
 
     /// Schrijft de huidige config weg, maakt tussenliggende mappen aan.

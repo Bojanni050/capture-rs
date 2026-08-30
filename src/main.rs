@@ -552,11 +552,11 @@ fn parse_duration(spec: &str) -> Result<i64> {
         .with_context(|| format!("kan tijdsduur niet lezen: {spec}"))?;
 
     let secs = match unit.trim() {
-        "" | "d" => n * 86_400,
-        "h" => n * 3_600,
-        "m" => n * 60,
+        "" | "d" => n.checked_mul(86_400).ok_or_else(|| anyhow!("tijdsduur te groot: {spec}"))?,
+        "h" => n.checked_mul(3_600).ok_or_else(|| anyhow!("tijdsduur te groot: {spec}"))?,
+        "m" => n.checked_mul(60).ok_or_else(|| anyhow!("tijdsduur te groot: {spec}"))?,
         "s" => n,
-        "w" => n * 604_800,
+        "w" => n.checked_mul(604_800).ok_or_else(|| anyhow!("tijdsduur te groot: {spec}"))?,
         other => return Err(anyhow!("onbekende eenheid {other:?}; gebruik s, m, h, d of w")),
     };
     Ok(secs)

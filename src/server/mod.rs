@@ -60,6 +60,12 @@ pub fn router(state: AppState) -> Router {
 }
 
 pub async fn serve(state: AppState, bind: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    if bind != "127.0.0.1" && bind != "localhost" && bind != "::1" {
+        tracing::warn!(
+            bind = bind,
+            "webserver bindt niet op localhost — geen authenticatie, alleen achter proxy blootstellen!"
+        );
+    }
     let addr: SocketAddr = format!("{bind}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -103,7 +109,10 @@ async fn search(
         limit: p.limit.unwrap_or(50).clamp(1, 500),
         offset: p.offset.unwrap_or(0).max(0),
     };
-    let hits = state.db.search(&query)?;
+    let db = Arc::clone(&state.db);
+    let hits = tokio::task::spawn_blocking(move || db.search(&query))
+        .await
+        .map_err(|e| anyhow::anyhow!("search task panicked: {e}"))??;
     Ok(Json(json!({ "hits": hits, "count": hits.len() })))
 }
 
@@ -114,9 +123,9 @@ struct RangeParams {
 }
 
 impl RangeParams {
-    /// Standaard: de afgelopen 24 uur.
+    /// Standaard: de afgelopen 24 uur (UTC epoch, zelfde als Local.timestamp()).
     fn resolve(&self) -> (i64, i64) {
-        let now = chrono::Local::now().timestamp();
+        let now = chrono::Utc::now().timestamp();
         (self.from.unwrap_or(now - 86_400), self.to.unwrap_or(now))
     }
 }
@@ -126,7 +135,10 @@ async fn timeline(
     Query(p): Query<RangeParams>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (from, to) = p.resolve();
-    let segments = state.db.timeline(from, to)?;
+    let db = Arc::clone(&state.db);
+    let segments = tokio::task::spawn_blocking(move || db.timeline(from, to))
+        .await
+        .map_err(|e| anyhow::anyhow!("timeline task panicked: {e}"))??;
     Ok(Json(json!({ "segments": segments })))
 }
 
@@ -135,30 +147,56 @@ async fn stats(
     Query(p): Query<RangeParams>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (from, to) = p.resolve();
-    let stats = state.db.stats(from, to)?;
-    let bytes = state.frames.disk_usage();
+    let db = Arc::clone(&state.db);
+    let frames = Arc::clone(&state.frames);
+    let (stats, bytes) = tokio::task::spawn_blocking(move || {
+        let stats = db.stats(from, to)?;
+        let bytes = frames.disk_usage();
+        Ok::<_, anyhow::Error>((stats, bytes))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("stats task panicked: {e}"))??;
     Ok(Json(json!({ "stats": stats, "frame_bytes": bytes })))
 }
 
 async fn apps(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(json!({ "apps": state.db.apps()? })))
+    let db = Arc::clone(&state.db);
+    let apps = tokio::task::spawn_blocking(move || db.apps())
+        .await
+        .map_err(|e| anyhow::anyhow!("apps task panicked: {e}"))??;
+    Ok(Json(json!({ "apps": apps })))
 }
 
 async fn capture(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> ApiResult<Response> {
-    match state.db.capture(id)? {
+    let db = Arc::clone(&state.db);
+    let cap = tokio::task::spawn_blocking(move || db.capture(id))
+        .await
+        .map_err(|e| anyhow::anyhow!("capture task panicked: {e}"))??;
+    match cap {
         Some(c) => Ok(Json(c).into_response()),
         None => Ok((StatusCode::NOT_FOUND, Json(json!({ "error": "niet gevonden" }))).into_response()),
     }
 }
 
 async fn frame(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
-    let Some(path) = state.db.frame_path(id)? else {
+    let db = Arc::clone(&state.db);
+    let frames = Arc::clone(&state.frames);
+    let result = tokio::task::spawn_blocking(move || {
+        let path = db.frame_path(id)?;
+        let Some(path) = path else {
+            return Ok::<_, anyhow::Error>(None);
+        };
+        let bytes = frames.read(&path)?;
+        Ok(Some(bytes))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("frame task panicked: {e}"))??;
+    let Some(bytes) = result else {
         return Ok((StatusCode::NOT_FOUND, "geen frame bij deze capture").into_response());
     };
-    let bytes = state.frames.read(&path)?;
     Ok((
         [
             (header::CONTENT_TYPE, "image/jpeg"),

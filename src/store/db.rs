@@ -636,6 +636,7 @@ impl Db {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let mut report = PurgeReport::default();
+        let mut seen = std::collections::HashSet::new();
 
         if let Some(cutoff) = captures_before {
             {
@@ -644,7 +645,10 @@ impl Db {
                 )?;
                 let rows = stmt.query_map([cutoff], |r| r.get::<_, String>(0))?;
                 for row in rows {
-                    report.frame_paths.push(row?);
+                    let p = row?;
+                    if seen.insert(p.clone()) {
+                        report.frame_paths.push(p);
+                    }
                 }
             }
             tx.execute(
@@ -666,7 +670,10 @@ impl Db {
                 )?;
                 let rows = stmt.query_map([cutoff], |r| r.get::<_, String>(0))?;
                 for row in rows {
-                    report.frame_paths.push(row?);
+                    let p = row?;
+                    if seen.insert(p.clone()) {
+                        report.frame_paths.push(p);
+                    }
                 }
             }
             report.frames_deleted = tx.execute(

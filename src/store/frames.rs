@@ -93,7 +93,17 @@ impl FrameStore {
 
     /// Verwijdert lege datummappen die na een purge zijn achtergebleven.
     pub fn prune_empty_dirs(&self) {
-        prune(&self.root);
+        // `prune` returnt `true` als een map leeg is en verwijderd is.
+        // We willen nooit de root zelf verwijderen — alleen sub-mappen.
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = prune(&path);
+            }
+        }
     }
 
     pub fn disk_usage(&self) -> u64 {
@@ -106,10 +116,19 @@ impl FrameStore {
     /// een expliciete controle op `..` is goedkoop.
     fn resolve(&self, rel: &str) -> Result<PathBuf> {
         let rel = rel.replace('\\', "/");
+        if rel.contains(':') || rel.contains('\0') || rel.contains("//") {
+            return Err(anyhow!("ongeldig framepad: {rel}"));
+        }
         if rel.split('/').any(|c| c == ".." || c == "." || c.is_empty()) {
             return Err(anyhow!("ongeldig framepad: {rel}"));
         }
-        Ok(self.root.join(rel))
+        let joined = self.root.join(&rel);
+        // `root.join` op Windows negeert root als `rel` absoluut is.
+        // Extra check: resolved pad moet met root beginnen.
+        if !joined.starts_with(&self.root) {
+            return Err(anyhow!("ongeldig framepad (escape): {rel}"));
+        }
+        Ok(joined)
     }
 }
 

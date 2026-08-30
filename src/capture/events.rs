@@ -7,9 +7,9 @@
 use anyhow::{anyhow, Result};
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use windows::Win32::UI::Accessibility::{
-    SetWinEventHook, UnhookWinEvent, EVENT_SYSTEM_FOREGROUND, HWINEVENTHOOK,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 /// Er kan maar één hook per proces actief zijn. Een globale sender is nodig
@@ -50,7 +50,10 @@ impl ForegroundEvents {
 
         if hook.is_invalid() {
             *sender_slot().lock().expect("foreground-eventslot poisoned") = None;
-            return Err(windows::core::Error::from_win32().into());
+            return Err(anyhow::anyhow!(
+                "SetWinEventHook faalde: {}",
+                std::io::Error::last_os_error()
+            ));
         }
 
         Ok((Self { hook }, rx))
@@ -79,9 +82,9 @@ unsafe extern "system" fn foreground_changed(
 ) {
     // `send` is niet-blokkerend. De pipeline voegt vervolgens meerdere snelle
     // meldingen samen met een debounce voordat er een capture wordt gemaakt.
-    if let Ok(sender) = sender_slot().lock() {
-        if let Some(tx) = sender.as_ref() {
-            let _ = tx.send(());
-        }
+    if let Ok(sender) = sender_slot().lock()
+        && let Some(tx) = sender.as_ref()
+    {
+        let _ = tx.send(());
     }
 }

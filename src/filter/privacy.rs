@@ -27,36 +27,47 @@ const DEFAULT_PATTERNS: &[&str] = &[
 ];
 
 pub struct Redactor {
-    patterns: Vec<Regex>,
+    /// Eén gecombineerde regex met alternatie (`|`) — single pass i.p.v. 8×.
+    combined: Option<Regex>,
     enabled: bool,
 }
 
 impl Redactor {
     pub fn new(enabled: bool, extra: &[String]) -> Result<Self> {
-        let mut patterns = Vec::new();
-        if enabled {
-            for p in DEFAULT_PATTERNS {
-                patterns.push(Regex::new(p).expect("ingebouwd patroon is geldig"));
-            }
-            for p in extra {
-                patterns.push(
-                    Regex::new(p).with_context(|| format!("ongeldige redact_extra-regex: {p}"))?,
-                );
-            }
+        if !enabled {
+            return Ok(Self {
+                combined: None,
+                enabled: false,
+            });
         }
-        Ok(Self { patterns, enabled })
+        let mut all: Vec<String> = DEFAULT_PATTERNS.iter().map(|s| format!("(?:{s})")).collect();
+        for p in extra {
+            // Valideer los, zodat foutmelding de schuldige toont.
+            Regex::new(p).with_context(|| format!("ongeldige redact_extra-regex: {p}"))?;
+            all.push(format!("(?:{p})"));
+        }
+        // Eén regex met alternatie is sneller dan sequentieel 8× replace.
+        // Elke DEFAULT_PATTERNS is al gevalideerd, dus expect is veilig.
+        let combined = if all.is_empty() {
+            None
+        } else {
+            Some(Regex::new(&all.join("|")).expect("gecombineerde redactie-regex is geldig"))
+        };
+        Ok(Self {
+            combined,
+            enabled: true,
+        })
     }
 
     /// Vervangt elk gevonden patroon door `[REDACTED]`.
     pub fn apply(&self, text: &str) -> String {
-        if !self.enabled || self.patterns.is_empty() {
+        if !self.enabled {
             return text.to_string();
         }
-        let mut out = text.to_string();
-        for re in &self.patterns {
-            out = re.replace_all(&out, "[REDACTED]").into_owned();
-        }
-        out
+        let Some(re) = &self.combined else {
+            return text.to_string();
+        };
+        re.replace_all(text, "[REDACTED]").into_owned()
     }
 }
 

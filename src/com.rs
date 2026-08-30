@@ -10,27 +10,31 @@ use std::sync::OnceLock;
 use windows::Win32::System::Com::CoIncrementMTAUsage;
 
 /// Idempotent: de eerste aanroep doet het werk, de rest leest het resultaat.
+///
+/// Bij failure wordt niet gecached — een volgende call kan opnieuw proberen
+/// (bv. COM was tijdelijk niet beschikbaar bij vroege startup).
 pub fn ensure_mta() -> Result<()> {
-    static DONE: OnceLock<bool> = OnceLock::new();
+    static DONE: OnceLock<Result<(), String>> = OnceLock::new();
 
-    let ok = *DONE.get_or_init(|| unsafe {
+    // Fast path: al succesvol geïnitialiseerd.
+    if let Some(res) = DONE.get() {
+        return res.clone().map_err(|e| anyhow!(e.clone()));
+    }
+
+    let res = unsafe {
         match CoIncrementMTAUsage() {
-            Ok(_cookie) => {
-                // De cookie is een handvat om de MTA later af te bouwen; wij
-                // willen hem juist houden zolang het proces leeft, dus we laten
-                // hem vallen zonder er iets mee te doen.
-                true
-            }
+            Ok(_cookie) => Ok(()),
             Err(e) => {
                 tracing::error!(error = %e, "COM/MTA initialiseren mislukt");
-                false
+                Err(format!("COM/MTA initialiseren mislukt: {e}"))
             }
         }
-    });
+    };
 
-    if ok {
-        Ok(())
-    } else {
-        Err(anyhow!("COM/MTA kon niet worden geïnitialiseerd"))
+    // Alleen succes cachen; bij fout mag een volgende call opnieuw proberen.
+    if res.is_ok() {
+        let _ = DONE.set(res.clone().map_err(|e| e.clone()));
+        // Clone voor return is goedkoop (Ok).
     }
+    res.map_err(|e| anyhow!(e))
 }

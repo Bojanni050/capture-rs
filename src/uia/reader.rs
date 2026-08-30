@@ -36,8 +36,8 @@ const LONG_TEXT_SPLIT: usize = 200;
 const MAX_SINGLE_TEXT: usize = 20_000;
 
 pub struct UiaReader {
-    automation: IUIAutomation,
-    cache: IUIAutomationCacheRequest,
+    pub(crate) automation: IUIAutomation,
+    pub(crate) cache: IUIAutomationCacheRequest,
     /// De content view: alleen knopen die inhoud dragen. De raw view bevat
     /// daarnaast elk decoratief paneel en elke scrollbar, en op een
     /// Electron-venster scheelt dat een orde van grootte in tijd.

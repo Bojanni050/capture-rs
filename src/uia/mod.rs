@@ -24,12 +24,11 @@ pub mod reader;
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use windows::Win32::Foundation::HWND;
 
-use crate::com::ensure_mta;
 use crate::config::UiaConfig;
 use events::{UiaEvent, UiaEventManager, start_event_thread};
 use reader::{UiaReader, WindowRead};
@@ -60,14 +59,15 @@ struct AppHealth {
 
 pub struct UiaService {
     tx: mpsc::Sender<Job>,
-    cfg: UiaConfig,
+    pub(crate) cfg: UiaConfig,
     health: HashMap<String, AppHealth>,
     denylist: Vec<String>,
     /// Event manager voor event-driven UIA lezen.
-    event_manager: Option<Arc<UiaEventManager>>,
+    pub(crate) event_manager: Option<UiaEventManager>,
     /// Ontvanger voor UIA events.
     event_receiver: Option<std_mpsc::Receiver<UiaEvent>>,
     /// Thread handle voor de event processing thread.
+    #[allow(dead_code)]
     event_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -109,7 +109,7 @@ impl UiaService {
         // Start event-driven UIA als dat ingeschakeld is
         let (event_manager, event_receiver, event_thread) = if cfg.event_driven {
             let (event_sender, event_receiver) = std_mpsc::channel();
-            
+
             // Creer een UiaReader om de automation en cache te delen
             let reader = UiaReader::new(cfg.max_elements)?;
 
@@ -118,9 +118,8 @@ impl UiaService {
                 reader.cache.clone(),
                 event_sender.clone(),
             )?;
-            let manager_arc = Arc::new(manager);
             let thread = start_event_thread(event_sender)?;
-            (Some(manager_arc), Some(event_receiver), Some(thread))
+            (Some(manager), Some(event_receiver), Some(thread))
         } else {
             (None, None, None)
         };

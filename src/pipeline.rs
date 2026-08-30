@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::block_in_place;
+use windows::Win32::Foundation::HWND;
 
 /// Hoe vaak we het geleerde boilerplate-geheugen wegschrijven (in tikken).
 const FLUSH_EVERY: u64 = 50;
@@ -94,6 +95,7 @@ pub struct Pipeline {
     segment: Option<Segment>,
     app_ids: HashMap<String, i64>,
     ticks: u64,
+    last_hwnd: Option<isize>,
 }
 
 impl Pipeline {
@@ -148,6 +150,7 @@ impl Pipeline {
             segment: None,
             app_ids: HashMap::new(),
             ticks: 0,
+            last_hwnd: None,
         })
     }
 
@@ -251,16 +254,22 @@ impl Pipeline {
         tracing::trace!(frames = shots.len(), "screenshot klaar");
 
         // Als event-driven UIA ingeschakeld is, registreer dan event handlers
-        // voor het voorgrondvenster
-        if let Some(ref mut uia_service) = self.uia {
-            if uia_service.cfg.event_driven {
-                if let Some(ref manager) = uia_service.event_manager {
-                    let hwnd_obj = HWND(window.hwnd as *mut core::ffi::c_void);
-                    if let Err(e) = manager.register_window_events(hwnd_obj) {
-                        tracing::debug!(app = app_key, error = %e, "UIA event registratie mislukt");
-                    }
-                }
+        // voor het voorgrondvenster (stub: alleen bookkeeping, geen echte hook).
+        // Alleen bij vensterwissel, anders groeit de handler-map onbegrensd.
+        if let Some(ref uia_service) = self.uia
+            && uia_service.cfg.event_driven
+            && let Some(ref manager) = uia_service.event_manager
+            && self.last_hwnd != Some(window.hwnd)
+        {
+            if let Some(old) = self.last_hwnd {
+                let old_hwnd = HWND(old as *mut core::ffi::c_void);
+                let _ = manager.unregister_window_events(old_hwnd);
             }
+            let hwnd_obj = HWND(window.hwnd as *mut core::ffi::c_void);
+            if let Err(e) = manager.register_window_events(hwnd_obj) {
+                tracing::debug!(app = app_key, error = %e, "UIA event registratie mislukt");
+            }
+            self.last_hwnd = Some(window.hwnd);
         }
 
         for shot in shots {

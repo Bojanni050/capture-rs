@@ -115,7 +115,7 @@ impl ScreenCapturer {
                     image,
                     monitor: name,
                 }),
-                Err(e) => tracing::debug!(monitor = %name, error = %e, "screenshot mislukt"),
+                Err(e) => tracing::warn!(monitor = %name, error = %e, "screenshot mislukt"),
             }
         }
         Ok(out)
