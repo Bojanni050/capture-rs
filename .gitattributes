@@ -1,0 +1,22 @@
+# Regeleindes: overal LF, ook in de werkboom op Windows.
+#
+# Zonder dit bepaalt ieders lokale core.autocrlf hoe bestanden op schijf
+# staan, en dan verschilt de werkboom per machine. Deze regel wint van
+# core.autocrlf, dus het project ziet er hetzelfde uit op Windows, Linux
+# en macOS.
+* text=auto eol=lf
+
+# Batch-bestanden hebben CRLF nodig; cmd.exe struikelt over LF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Nooit aan regeleindes zitten in binaire bestanden. `text=auto` herkent de
+# meeste vanzelf, maar expliciet is betrouwbaarder voor wat dit project
+# zoal zal bevatten.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.webp binary
+*.exe binary
+*.dll binary
