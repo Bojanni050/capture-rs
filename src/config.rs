@@ -59,10 +59,9 @@ impl Default for UiaConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // Event-driven is nu een stub (zie src/uia/events.rs) — alleen
-            // bookkeeping, geen echte COM handlers. Default uit tot de
-            // implementatie met #[implement(IUIAutomation...Handler)] af is.
-            event_driven: false,
+            // Event-driven: via echte COM handlers (AddStructureChanged/
+            // AddPropertyChanged) — alleen lezen bij verandering, geen polling.
+            event_driven: true,
             // Hoger dan de OCR-drempel: een boom die alleen "Bestand" en "OK"
             // oplevert is geen inhoud, en dan wil je alsnog OCR proberen.
             // Chromium-browsers schakelen accessibility geleidelijk in, dus de
