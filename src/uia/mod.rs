@@ -13,16 +13,25 @@
 //!    Electron-apps hebben een lege of nutteloze boom. Voor die apps is elke
 //!    UIA-poging verspilling, dus we onthouden per app of het wat oplevert en
 //!    zetten hem tijdelijk uit als het een paar keer niks werd.
+//!
+//! 3. **Event-driven modus.** Als `event_driven` ingeschakeld is, gebruiken we
+//!    AddStructureChangedEventHandler en AddPropertyChangedEventHandler om de
+//!    boom alleen uit te lezen wanneer de app zelf meldt dat er iets veranderd is.
+//!    Dit is architectonisch beter: geen polling, alleen lezen bij veranderingen.
 
+pub mod events;
 pub mod reader;
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use windows::Win32::Foundation::HWND;
 
+use crate::com::ensure_mta;
 use crate::config::UiaConfig;
+use events::{UiaEvent, UiaEventManager, start_event_thread};
 use reader::{UiaReader, WindowRead};
 
 struct Job {
@@ -54,6 +63,12 @@ pub struct UiaService {
     cfg: UiaConfig,
     health: HashMap<String, AppHealth>,
     denylist: Vec<String>,
+    /// Event manager voor event-driven UIA lezen.
+    event_manager: Option<Arc<UiaEventManager>>,
+    /// Ontvanger voor UIA events.
+    event_receiver: Option<std_mpsc::Receiver<UiaEvent>>,
+    /// Thread handle voor de event processing thread.
+    event_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl UiaService {
@@ -91,11 +106,35 @@ impl UiaService {
 
         let denylist = cfg.app_denylist.iter().map(|a| a.to_lowercase()).collect();
 
+        // Start event-driven UIA als dat ingeschakeld is
+        let (event_manager, event_receiver, event_thread) = if cfg.event_driven {
+            ensure_mta()?;
+            let (event_sender, event_receiver) = std_mpsc::channel();
+            let max_elements = cfg.max_elements;
+
+            // Creer een UiaReader om de automation en cache te delen
+            let reader = UiaReader::new(max_elements)?;
+
+            let manager = UiaEventManager::new(
+                reader.automation.clone(),
+                reader.cache.clone(),
+                event_sender.clone(),
+            );
+            let manager_arc = Arc::new(manager);
+            let thread = start_event_thread(event_sender)?;
+            (Some(manager_arc), Some(event_receiver), Some(thread))
+        } else {
+            (None, None, None)
+        };
+
         Ok(Self {
             tx,
             cfg,
             health: HashMap::new(),
             denylist,
+            event_manager,
+            event_receiver,
+            event_thread,
         })
     }
 
@@ -109,6 +148,28 @@ impl UiaService {
             return Outcome::Unavailable("uia levert niets voor deze app");
         }
 
+        // Als event-driven UIA ingeschakeld is, check dan of er events zijn
+        if let Some(ref event_receiver) = self.event_receiver {
+            // Check of er een event is voor dit venster
+            if let Ok(event) = event_receiver.try_recv() {
+                match event {
+                    UiaEvent::StructureChanged { hwnd: event_hwnd, .. } if event_hwnd == hwnd => {
+                        // Er is een structurele verandering, lees de boom nu
+                        return self.read_after_event(app_key, hwnd).await;
+                    }
+                    UiaEvent::PropertyChanged { hwnd: event_hwnd, property_id } if event_hwnd == hwnd => {
+                        // Er is een property verandering, lees de boom nu
+                        tracing::debug!(app = app_key, property = property_id.0, "UIA property veranderd");
+                        return self.read_after_event(app_key, hwnd).await;
+                    }
+                    _ => {
+                        // Event is voor een ander venster, doe niets
+                    }
+                }
+            }
+        }
+
+        // Normale leesactie als er geen event is
         let (reply, rx) = oneshot::channel();
         // Bezet? Dan hangt de vorige aanroep nog; niet wachten.
         if self.tx.try_send(Job { hwnd, reply }).is_err() {
@@ -144,6 +205,34 @@ impl UiaService {
         Outcome::Text(read.lines)
     }
 
+    /// Lees de boom na een event (event-driven modus).
+    async fn read_after_event(&mut self, app_key: &str, hwnd: isize) -> Outcome {
+        if let Some(ref manager) = self.event_manager {
+            let hwnd_obj = HWND(hwnd as *mut core::ffi::c_void);
+
+            // Lees direct de boom na het event
+            match manager.read_window_after_event(hwnd_obj) {
+                Ok(read) => {
+                    if read.chars() >= self.cfg.min_text_len {
+                        self.record_success(app_key);
+                        return Outcome::Text(read.lines);
+                    } else {
+                        self.record_failure(app_key);
+                        return Outcome::Unavailable("uia gaf te weinig tekst na event");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(app = app_key, error = %e, "uia-lezen na event mislukt");
+                    self.record_failure(app_key);
+                    return Outcome::Unavailable("uia-fout na event");
+                }
+            }
+        }
+
+        // Als event-driven niet beschikbaar is, gebruik de normale methode
+        Outcome::Unavailable("event-driven uia niet beschikbaar")
+    }
+
     fn is_denied(&self, app_key: &str) -> bool {
         let key = app_key.to_lowercase();
         self.denylist.iter().any(|a| key.contains(a.as_str()))
@@ -164,7 +253,7 @@ impl UiaService {
         if health.failures >= self.cfg.failures_before_skip {
             health.skip_until =
                 Some(Instant::now() + Duration::from_secs(self.cfg.retry_after_secs));
-            // Eén strafpunt terug, zodat de app na de afkoelperiode nog één
+            // Een strafpunt terug, zodat de app na de afkoelperiode nog een
             // eerlijke kans krijgt voordat hij er weer uit vliegt. Apps
             // schakelen accessibility soms alsnog in.
             health.failures = self.cfg.failures_before_skip.saturating_sub(1);
@@ -198,6 +287,9 @@ mod tests {
             cfg,
             health: HashMap::new(),
             denylist,
+            event_manager: None,
+            event_receiver: None,
+            event_thread: None,
         }
     }
 
@@ -254,7 +346,7 @@ mod tests {
         s.record_failure("app");
         assert!(!s.is_sleeping("app"), "afkoelperiode van 0 is meteen voorbij");
 
-        // Het strafblad staat op één, dus één mislukking zet hem weer uit.
+        // Het strafblad staat op een, dus een mislukking zet hem weer uit.
         s.record_failure("app");
         assert_eq!(s.health["app"].failures, 1);
     }

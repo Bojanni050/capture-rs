@@ -39,6 +39,8 @@ pub struct CaptureConfig {
 pub struct UiaConfig {
     /// UI Automation als primaire tekstbron gebruiken.
     pub enabled: bool,
+    /// Gebruik event-driven UIA in plaats van polling.
+    pub event_driven: bool,
     /// Minder tekens dan dit uit de boom → doorschuiven naar OCR.
     pub min_text_len: usize,
     /// Bovengrens op het aantal knopen dat we per venster uitlezen.
@@ -57,6 +59,9 @@ impl Default for UiaConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            // Event-driven modus: alleen lezen wanneer de app meldt dat er iets veranderd is.
+            // Dit is architectonisch beter maar vereist dat apps events sturen.
+            event_driven: false,
             // Hoger dan de OCR-drempel: een boom die alleen "Bestand" en "OK"
             // oplevert is geen inhoud, en dan wil je alsnog OCR proberen.
             // Chromium-browsers schakelen accessibility geleidelijk in, dus de
