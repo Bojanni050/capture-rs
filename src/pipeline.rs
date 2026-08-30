@@ -19,9 +19,9 @@
 //!    ontwerptool), dan bewaren we het frame zelf, zodat er nooit een gat in
 //!    je tijdlijn valt.
 
-use crate::capture::{foreground, idle_seconds, ScreenCapturer, WindowInfo};
+use crate::capture::{ScreenCapturer, WindowInfo, foreground, idle_seconds};
 use crate::config::{Config, FramePolicy};
-use crate::filter::{dedupe, Gate, NoiseFilter};
+use crate::filter::{Gate, NoiseFilter, TextAnalysis, dedupe};
 use crate::ocr::OcrService;
 use crate::store::{Db, FrameStore, NewCapture};
 use crate::uia::{self, UiaService};
@@ -66,18 +66,23 @@ impl Source {
 struct FrameContext<'a> {
     segment_id: i64,
     app_key: &'a str,
-    hwnd: isize,
     monitor: &'a str,
     ts: i64,
     now: &'a chrono::DateTime<Local>,
 }
 
 /// Uitkomst van een leespoging over alle tekstbronnen heen.
+#[derive(Clone)]
 struct TextRead {
     lines: Vec<String>,
     source: Source,
     /// Waarom een eerdere bron afviel; belandt in `fallback_reason`.
     note: Option<String>,
+}
+
+enum UiaCaptureOutcome {
+    Complete,
+    NeedsImage(TextAnalysis),
 }
 
 pub struct Pipeline {
@@ -200,11 +205,10 @@ impl Pipeline {
         let window = foreground();
 
         // Laag 1: de poort.
-        if let Gate::Skip(reason) = self.filter.gate(
-            window.as_ref(),
-            idle,
-            self.cfg.capture.idle_after_secs,
-        ) {
+        if let Gate::Skip(reason) =
+            self.filter
+                .gate(window.as_ref(), idle, self.cfg.capture.idle_after_secs)
+        {
             self.db
                 .record_skip(&now.format("%Y-%m-%d").to_string(), reason.as_str())?;
             // Een lopend segment eindigt zodra je iets anders gaat doen.
@@ -217,8 +221,51 @@ impl Pipeline {
         let app_id = self.app_id(&window)?;
         let segment_id = self.segment_for(app_id, &app_key, &window.title, ts)?;
 
-        // Screenshots zijn de duurste synchrone stap; block_in_place houdt de
-        // runtime beschikbaar voor de webserver.
+        // UIA heeft geen pixels nodig. Als het actieve venster bruikbare
+        // accessibility-tekst geeft, slaan we de screenshot helemaal over.
+        // Dat is vooral winstgevend bij editors en browsers, waar een volledig
+        // scherm kopiëren vaak duurder is dan de tekst zelf uitlezen.
+        //
+        // De uitkomst houden we ook vast voor het screenshotpad hieronder:
+        // bij meerdere monitoren mag UIA niet één keer per monitor draaien.
+        let uia_read = self.read_uia(&app_key, window.hwnd).await;
+        if uia_read.source == Source::Uia
+            && self.cfg.uia.min_text_len >= self.cfg.ocr.min_text_len
+            && self.cfg.storage.keep_frames != FramePolicy::Always
+        {
+            match self.process_uia_capture(segment_id, &app_key, ts, &now, uia_read)? {
+                UiaCaptureOutcome::Complete => {
+                    if self.ticks.is_multiple_of(FLUSH_EVERY) {
+                        self.flush_boilerplate()?;
+                    }
+                    return Ok(());
+                }
+                UiaCaptureOutcome::NeedsImage(analysis) => {
+                    // De overige monitoren zouden in het oude pad door
+                    // dezelfde tekstvergelijking worden overgeslagen.
+                    let shot = block_in_place(|| self.capturer.capture())?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("screenshot leverde geen frames op"))?;
+                    self.store_uia_fallback(
+                        segment_id,
+                        ts,
+                        &now,
+                        &shot.monitor,
+                        shot.image,
+                        analysis,
+                    )?;
+                    if self.ticks.is_multiple_of(FLUSH_EVERY) {
+                        self.flush_boilerplate()?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // Screenshots zijn de duurste synchrone stap; we komen hier alleen
+        // wanneer UIA geen bruikbare tekst gaf (of wanneer een afwijkende
+        // configuratie nog een beeldfallback kan vereisen).
         tracing::trace!("screenshot maken");
         let shots = block_in_place(|| self.capturer.capture())?;
         tracing::trace!(frames = shots.len(), "screenshot klaar");
@@ -228,12 +275,12 @@ impl Pipeline {
                 FrameContext {
                     segment_id,
                     app_key: &app_key,
-                    hwnd: window.hwnd,
                     monitor: &shot.monitor,
                     ts,
                     now: &now,
                 },
                 shot.image,
+                &uia_read,
             )
             .await?;
         }
@@ -244,11 +291,15 @@ impl Pipeline {
         Ok(())
     }
 
-    async fn process_frame(&mut self, ctx: FrameContext<'_>, image: RgbaImage) -> Result<()> {
+    async fn process_frame(
+        &mut self,
+        ctx: FrameContext<'_>,
+        image: RgbaImage,
+        uia_read: &TextRead,
+    ) -> Result<()> {
         let FrameContext {
             segment_id,
             app_key,
-            hwnd,
             monitor,
             ts,
             now,
@@ -265,7 +316,7 @@ impl Pipeline {
         }
 
         // Laag 3: lezen wat er staat — eerst de accessibility-boom, dan OCR.
-        let read = self.read_text(app_key, hwnd, &image).await;
+        let read = self.read_text_after_uia(uia_read, &image).await;
         let analysis = self.filter.analyze_text(app_key, &read.lines);
 
         // Zelfde woorden als het vorige frame: er bewoog iets (een cursor, een
@@ -281,9 +332,9 @@ impl Pipeline {
         let fallback_reason = match read.source {
             // UIA levert de échte tekens, dus daar hoeft geen kwaliteitsoordeel
             // overheen; alleen de vraag of er ná filtering nog inhoud over is.
-            Source::Uia if char_len < self.cfg.ocr.min_text_len => {
-                Some(format!("uia-tekst bleef niet over na filtering ({char_len} tekens)"))
-            }
+            Source::Uia if char_len < self.cfg.ocr.min_text_len => Some(format!(
+                "uia-tekst bleef niet over na filtering ({char_len} tekens)"
+            )),
             Source::Uia => None,
 
             Source::Ocr if char_len < self.cfg.ocr.min_text_len => {
@@ -298,10 +349,18 @@ impl Pipeline {
             Source::None => Some(read.note.clone().unwrap_or_else(|| "geen tekstbron".into())),
         };
 
-        let kind = if fallback_reason.is_some() { "image" } else { "text" };
+        let kind = if fallback_reason.is_some() {
+            "image"
+        } else {
+            "text"
+        };
         // De opgeslagen bron is die welke de bewaarde tekst leverde; valt alles
         // terug op beeld, dan is er geen tekstbron en zegt de reden waarom.
-        let source = if kind == "image" { Source::None } else { read.source };
+        let source = if kind == "image" {
+            Source::None
+        } else {
+            read.source
+        };
 
         let keep_frame = match self.cfg.storage.keep_frames {
             FramePolicy::Always => true,
@@ -363,12 +422,105 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Haalt de tekst op via de goedkoopste bron die iets bruikbaars geeft.
-    ///
-    /// UIA eerst: als de app zijn accessibility-boom netjes vult, is dat
-    /// exacter én sneller dan pixels lezen. Levert dat niets op, dan doet OCR
-    /// alsnog het werk.
-    async fn read_text(&mut self, app_key: &str, hwnd: isize, image: &RgbaImage) -> TextRead {
+    /// Slaat een UIA-resultaat op zonder eerst pixels van het scherm te halen.
+    /// De tekstvergelijking blijft van kracht, dus herhaalde UIA-bomen maken
+    /// geen extra captures aan.
+    fn process_uia_capture(
+        &mut self,
+        segment_id: i64,
+        app_key: &str,
+        ts: i64,
+        now: &chrono::DateTime<Local>,
+        read: TextRead,
+    ) -> Result<UiaCaptureOutcome> {
+        let day = now.format("%Y-%m-%d").to_string();
+        let analysis = self.filter.analyze_text(app_key, &read.lines);
+
+        if analysis.same_as_previous {
+            self.db.touch_segment(segment_id, ts)?;
+            self.db.record_skip(&day, "zelfde tekst")?;
+            return Ok(UiaCaptureOutcome::Complete);
+        }
+
+        // UIA kan vóór filtering genoeg tekens hebben, terwijl er daarna
+        // alleen boilerplate overblijft. Behoud dan de image-fallback.
+        if analysis.char_len() < self.cfg.ocr.min_text_len {
+            return Ok(UiaCaptureOutcome::NeedsImage(analysis));
+        }
+        self.db.insert_capture(NewCapture {
+            segment_id,
+            ts,
+            kind: "text",
+            source: Source::Uia.as_str(),
+            // UIA hoort bij het actieve venster, niet bij een screenshot.
+            monitor: "actief venster",
+            phash: 0,
+            quality: analysis.quality,
+            text: &analysis.full_text,
+            index_text: &analysis.index_text,
+            frame_path: None,
+            width: 0,
+            height: 0,
+            fallback_reason: None,
+        })?;
+
+        tracing::debug!(
+            app = app_key,
+            soort = "text",
+            bron = "uia",
+            tekens = analysis.char_len(),
+            kwaliteit = analysis.quality,
+            boilerplate = analysis.boilerplate_lines,
+            "vastgelegd zonder screenshot"
+        );
+        Ok(UiaCaptureOutcome::Complete)
+    }
+
+    fn store_uia_fallback(
+        &mut self,
+        segment_id: i64,
+        ts: i64,
+        now: &chrono::DateTime<Local>,
+        monitor: &str,
+        image: RgbaImage,
+        analysis: TextAnalysis,
+    ) -> Result<()> {
+        let day = now.format("%Y-%m-%d").to_string();
+        if self.cfg.storage.keep_frames == FramePolicy::Never {
+            self.db.touch_segment(segment_id, ts)?;
+            self.db.record_skip(&day, "geen bruikbare inhoud")?;
+            return Ok(());
+        }
+
+        let hash = block_in_place(|| dedupe::dhash(&image));
+        let frames = Arc::clone(&self.frames);
+        let saved = block_in_place(|| frames.save(&image, ts));
+        let Ok((path, width, height)) = saved else {
+            self.db.touch_segment(segment_id, ts)?;
+            self.db.record_skip(&day, "geen bruikbare inhoud")?;
+            return Ok(());
+        };
+        self.db.insert_capture(NewCapture {
+            segment_id,
+            ts,
+            kind: "image",
+            source: Source::None.as_str(),
+            monitor,
+            phash: hash,
+            quality: analysis.quality,
+            text: &analysis.full_text,
+            index_text: &analysis.index_text,
+            frame_path: Some(&path),
+            width,
+            height,
+            fallback_reason: Some("uia-tekst bleef niet over na filtering"),
+        })?;
+        Ok(())
+    }
+
+    /// Probeert UIA precies één keer per tik, vóór er een screenshot wordt
+    /// gemaakt. Een mislukking wordt als notitie meegenomen naar OCR.
+    async fn read_uia(&mut self, app_key: &str, hwnd: isize) -> TextRead {
         let mut note = None;
 
         if let Some(service) = &mut self.uia {
@@ -378,7 +530,7 @@ impl Pipeline {
                         lines,
                         source: Source::Uia,
                         note: None,
-                    }
+                    };
                 }
                 uia::Outcome::Unavailable(reason) => {
                     tracing::trace!(app = app_key, reden = reason, "uia overgeslagen");
@@ -387,6 +539,21 @@ impl Pipeline {
             }
         }
 
+        TextRead {
+            lines: Vec::new(),
+            source: Source::None,
+            note,
+        }
+    }
+
+    /// Gebruikt een al uitgevoerde UIA-lezing, of valt per screenshot terug op
+    /// OCR. Daardoor wordt UIA bij `monitor = "all"` niet herhaald.
+    async fn read_text_after_uia(&self, uia_read: &TextRead, image: &RgbaImage) -> TextRead {
+        if uia_read.source == Source::Uia {
+            return uia_read.clone();
+        }
+
+        let note = uia_read.note.clone();
         if let Some(service) = &self.ocr {
             match service.recognize(image.clone()).await {
                 Ok(raw) => {
@@ -394,7 +561,7 @@ impl Pipeline {
                         lines: raw.lines,
                         source: Source::Ocr,
                         note,
-                    }
+                    };
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "OCR mislukt");
