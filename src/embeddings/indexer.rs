@@ -62,7 +62,12 @@ impl Indexer {
         // Sla eerste tick over
         interval.tick().await;
 
-        let mut last_seen_id: i64 = 0;
+        // Duurzaam vanaf hier verder, niet vanaf 0: zonder dit herembedde elke
+        // herstart de hele geschiedenis in batches van 500 rijen.
+        let db = Arc::clone(&self.db);
+        let mut last_seen_id: i64 = tokio::task::spawn_blocking(move || db.load_embeddings_cursor())
+            .await
+            .map_err(|e| anyhow::anyhow!("cursor lezen panicked: {e}"))??;
 
         loop {
             tokio::select! {
@@ -104,7 +109,11 @@ impl Indexer {
         if rows.is_empty() {
             return Ok(0);
         }
-        *last_seen = rows.iter().map(|r| r.id).max().unwrap_or(*last_seen);
+        // Waar deze batch tot komt — pas vastgelegd zodra we er ook echt iets
+        // mee gedaan hebben. Verder dan dit gaan we vandaag niet terug, ook
+        // al levert de batch zelf geen documenten op (te kort/gefilterd):
+        // die rijen leveren bij een volgende poging evengoed niets nieuws op.
+        let advanced_to = rows.iter().map(|r| r.id).max().unwrap_or(*last_seen);
 
         // Groepeer tot documents deterministisch.
         let docs = build_documents(
@@ -116,6 +125,7 @@ impl Indexer {
             self.provider.dimensions(),
         );
         if docs.is_empty() {
+            self.commit_cursor(last_seen, advanced_to).await?;
             return Ok(0);
         }
 
@@ -126,9 +136,24 @@ impl Indexer {
             .await
             .map_err(|e| anyhow::anyhow!("embed task panicked: {e}"))??;
 
-        // Upsert — als PG down, retourneer fout zodat retry later gebeurt, maar capture blijft in SQLite.
+        // Upsert — als PG down, geeft dit een fout en stopt tick_once hier via
+        // `?`. De cursor wordt dan bewust NIET bijgewerkt: deze batch blijft
+        // "nieuw" voor de volgende tik, zodat een teruggekomen PG hem alsnog
+        // oppakt in plaats van dat hij stilzwijgend overgeslagen wordt.
         let n = self.store.upsert(docs, embeddings).await?;
+        self.commit_cursor(last_seen, advanced_to).await?;
         Ok(n)
+    }
+
+    /// Werkt de cursor bij in het geheugen én in SQLite, in die volgorde: pas
+    /// als de opslag lukt telt de voortgang als definitief.
+    async fn commit_cursor(&self, last_seen: &mut i64, advanced_to: i64) -> Result<()> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.save_embeddings_cursor(advanced_to))
+            .await
+            .map_err(|e| anyhow::anyhow!("cursor opslaan panicked: {e}"))??;
+        *last_seen = advanced_to;
+        Ok(())
     }
 }
 

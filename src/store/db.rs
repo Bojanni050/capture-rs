@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::path::Path;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -151,6 +151,9 @@ impl Db {
         if version < 2 {
             Self::migrate_v2(&conn)?;
         }
+        if version < 3 {
+            Self::migrate_v3(&conn)?;
+        }
 
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -232,6 +235,21 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_captures_source ON captures(source);",
         )
         .context("migratie naar schema v2 mislukt")?;
+        Ok(())
+    }
+
+    /// v3 voegt een duurzame cursor toe voor de embeddings-indexer: welke
+    /// capture-id hij als laatste heeft verwerkt. Zonder dit begon de indexer
+    /// bij elke herstart weer bij 0 en herembedde hij de hele geschiedenis.
+    fn migrate_v3(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS embeddings_cursor (
+                id           INTEGER PRIMARY KEY CHECK (id = 1),
+                last_seen_id INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT OR IGNORE INTO embeddings_cursor (id, last_seen_id) VALUES (1, 0);",
+        )
+        .context("migratie naar schema v3 mislukt")?;
         Ok(())
     }
 
@@ -718,15 +736,23 @@ impl Db {
         Ok(())
     }
 
-    /// Voor embeddings: lees captures sinds id, alleen `text` met index_text.
+    /// Voor embeddings: lees captures sinds id, met de gefilterde `index_text`.
+    ///
+    /// Leest bewust uit `captures_fts`, niet uit `captures.text`: die laatste
+    /// is de vólledige tekst inclusief boilerplate (menubalken, chrome) die
+    /// het ruisfilter er juist uithaalt. `captures_fts.text` is de tekst zoals
+    /// die ook echt doorzoekbaar is; alleen daar heeft een capture een rij als
+    /// er na filtering iets overbleef, dus de join filtert lege captures er
+    /// vanzelf uit.
     pub fn fetch_captures_since(&self, since_id: i64) -> Result<Vec<crate::embeddings::CaptureRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT c.id, c.ts, a.key, s.title, c.source, c.frame_path, c.text
+            "SELECT c.id, c.ts, a.key, s.title, c.source, c.frame_path, f.text
              FROM captures c
-             JOIN segments s ON s.id = c.segment_id
-             JOIN apps a ON a.id = s.app_id
-             WHERE c.id > ?1 AND c.kind = 'text' AND trim(c.text) != ''
+             JOIN segments s     ON s.id = c.segment_id
+             JOIN apps a         ON a.id = s.app_id
+             JOIN captures_fts f ON f.rowid = c.id
+             WHERE c.id > ?1 AND c.kind = 'text'
              ORDER BY c.id ASC
              LIMIT 500",
         )?;
@@ -746,6 +772,29 @@ impl Db {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Waar de embeddings-indexer gebleven was, over herstarts heen. Zonder
+    /// dit begon elke `chronicle start` weer bij capture 1 en herembedde de
+    /// hele geschiedenis.
+    pub fn load_embeddings_cursor(&self) -> Result<i64> {
+        self.lock()
+            .query_row(
+                "SELECT last_seen_id FROM embeddings_cursor WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .context("embeddings-cursor lezen mislukt")
+    }
+
+    pub fn save_embeddings_cursor(&self, last_seen_id: i64) -> Result<()> {
+        self.lock()
+            .execute(
+                "UPDATE embeddings_cursor SET last_seen_id = ?1 WHERE id = 1",
+                params![last_seen_id],
+            )
+            .context("embeddings-cursor opslaan mislukt")?;
+        Ok(())
     }
 
     /// Expose lock voor indexer (pub(crate) via wrapper).

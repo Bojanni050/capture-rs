@@ -1,7 +1,11 @@
 # Chronicle Embeddings — Architecture Proposal
 
 ## Status
-Draft — inspectie afgerond 2026-08-31, wacht op go voordat implementatie start.
+Geïmplementeerd als scaffolding, **niet productie-klaar**. `embeddings.enabled`
+staat standaard op `false`. Zie [§9 Bekende beperkingen](#9-bekende-beperkingen)
+voordat je het aanzet — met name: er zit nog geen echt embeddingmodel achter,
+dus semantisch zoeken vindt op dit moment alleen letterlijke herhalingen, geen
+verwante tekst in andere bewoordingen.
 
 ## 1. Inspectie
 
@@ -104,4 +108,49 @@ Env override: `CHRONICLE_POSTGRES_URL` > `postgres_url`. Secrets nooit in TOML l
 - `pgvector` installeren op Windows PG18 (handmatig via release zip `pgvector-0.8.0-pg18-windows`). Zonder is semantic index "pending".
 - Model download bij eerste run — documenteer 120 MB.
 
-Go voor implementatie?
+## 9. Bekende beperkingen
+
+De implementatie (`src/embeddings/`) volgt dit voorstel structureel, maar is op
+een aantal punten blijven steken bij scaffolding. Twee correctheidsbugs zijn
+gefixt (zie git-historie: `fetch_captures_since` gebruikte `captures.text` in
+plaats van de gefilterde tekst uit `captures_fts`, en de indexer-cursor
+overleefde geen herstart). De rest staat hier gedocumenteerd, bewust niet
+opgelost:
+
+- **Geen echt embeddingmodel.** `make_provider` in `embeddings/mod.rs`
+  construeert altijd een `MockProvider` — §7 stap 1 noemt `FastEmbedProvider`
+  als optionele feature, maar die is nooit gebouwd. `MockProvider::mock_embed`
+  hasht de volledige inputtekst per dimensie; twee verschillende formuleringen
+  van hetzelfde idee leveren vectoren op die net zo oncorreleerd zijn als
+  willekeurige tekst. Bruikbaar voor deterministische tests, niet voor
+  semantisch zoeken. Zie de vraag "which local model" in de sessie-historie
+  voor een concrete aanbeveling (`intfloat/multilingual-e5-small` via
+  `fastembed`, 384 dims — sluit aan op de dimensies die nu al overal
+  hardcoded staan).
+- **`InMemoryStore` is niet gedeeld tussen processen.** Zonder `postgres_url`
+  bouwt elke processtart zijn eigen lege `Vec` op. `cmd_start` deelt één
+  instantie tussen zijn eigen indexer en webserver (vandaar dat de HTTP-API
+  wél werkt), maar een losse CLI-aanroep (`chronicle search --semantic`,
+  `chronicle embeddings status/rebuild`) krijgt altijd een verse, lege store.
+  `rebuild` meldt dan "N documenten geïndexeerd" voor werk dat bij het
+  afsluiten van het proces alweer weg is — een foutmelding zou hier eerlijker
+  zijn dan een geslaagd ogende no-op. Met de cursor nu wél persistent (zie
+  boven) geldt dit ook na een herstart: captures die ooit "verwerkt" zijn
+  volgens de cursor, maar nooit in een duurzame store terechtkwamen, worden
+  niet opnieuw geprobeerd. Alleen `chronicle embeddings rebuild` haalt ze dan
+  nog terug.
+- **Geen connection pooling.** Elke `VectorStore`-aanroep
+  (`ensure_schema`/`upsert`/`search`/`delete_before`/`count`) opent een eigen
+  `tokio_postgres::connect`. Werkt, maar een verbinding per aanroep in plaats
+  van een pool is nodeloos duur zodra dit vaker draait dan eens per paar
+  seconden.
+- **`InMemoryStore` gebruikt kale `.unwrap()`** op zijn `RwLock`
+  (`store.rs`), inconsistent met de rest van de codebase — overal elders
+  (`store/db.rs`, `uia/`) herstelt een vergiftigd lock zich via
+  `unwrap_or_else(|e| e.into_inner())` in plaats van te pankieken.
+- **De directe notificatie-route is dode code.** `IndexCommand::Capture` en
+  `make_indexer` (met zijn `mpsc`-kanaal voor "capture net binnen") worden
+  nergens aangeroepen — `cmd_start` bouwt de indexer rechtstreeks op met
+  `rx: None`. De indexer werkt uitsluitend via polling.
+- **Niet genoemd in `README.md`.** Wie het naslaat zonder in `docs/` of
+  `chronicle.toml` te kijken, weet niet dat dit bestaat.

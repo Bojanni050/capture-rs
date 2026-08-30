@@ -223,9 +223,23 @@ src/
   ocr/        Windows.Media.Ocr op een eigen thread
   filter/     de vier lagen: dedupe, text, privacy, en mod.rs die ze aanstuurt
   store/      SQLite + FTS5, en frames als JPEG op schijf
+  embeddings/ semantische laag (experimenteel, uit by default — zie hieronder)
   server/     axum: JSON-API en de ingebouwde webpagina
   pipeline.rs de opnamelus die alles aan elkaar knoopt
 ```
+
+## Semantisch zoeken (experimenteel)
+
+Naast FTS5 zit er een `[embeddings]`-sectie in de config (`enabled = false`
+standaard) die captures groepeert, embedt en in pgvector opslaat voor
+`chronicle search --semantic`. Dit is nog scaffolding, geen afgeronde
+feature: er zit op dit moment geen echt embeddingmodel achter — alleen een
+deterministische mock die exacte herhalingen herkent, geen verwante tekst in
+andere bewoordingen — en zonder een draaiende Postgres/pgvector deelt geen
+enkele losse CLI-aanroep zijn data met een lopend `chronicle start`-proces.
+Zie [`docs/embeddings-proposal.md`](docs/embeddings-proposal.md) voor de
+volledige architectuur en een expliciete lijst bekende beperkingen voordat je
+het aanzet.
 
 ## Privacy
 
