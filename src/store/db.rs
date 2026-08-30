@@ -717,6 +717,41 @@ impl Db {
         self.lock().execute_batch("VACUUM")?;
         Ok(())
     }
+
+    /// Voor embeddings: lees captures sinds id, alleen `text` met index_text.
+    pub fn fetch_captures_since(&self, since_id: i64) -> Result<Vec<crate::embeddings::CaptureRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.ts, a.key, s.title, c.source, c.frame_path, c.text
+             FROM captures c
+             JOIN segments s ON s.id = c.segment_id
+             JOIN apps a ON a.id = s.app_id
+             WHERE c.id > ?1 AND c.kind = 'text' AND trim(c.text) != ''
+             ORDER BY c.id ASC
+             LIMIT 500",
+        )?;
+        let rows = stmt.query_map([since_id], |r| {
+            Ok(crate::embeddings::CaptureRow {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                app: r.get(2)?,
+                title: r.get(3)?,
+                source: r.get::<_, String>(4)?,
+                has_frame: r.get::<_, Option<String>>(5)?.is_some(),
+                index_text: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Expose lock voor indexer (pub(crate) via wrapper).
+    pub(crate) fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.lock()
+    }
 }
 
 /// Voegt de gedeelde WHERE-filters toe aan zowel zoeken als bladeren.

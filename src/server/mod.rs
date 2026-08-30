@@ -7,6 +7,7 @@
 
 mod ui;
 
+use crate::embeddings::{store::VectorStore, EmbeddingProvider};
 use crate::store::{Db, FrameStore, SearchQuery};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
@@ -22,6 +23,8 @@ use std::sync::Arc;
 pub struct AppState {
     pub db: Arc<Db>,
     pub frames: Arc<FrameStore>,
+    pub embeddings_store: Option<Arc<dyn VectorStore>>,
+    pub embeddings_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 /// Fouten netjes als JSON teruggeven in plaats van een kale 500.
@@ -51,11 +54,13 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/search", get(search))
+        .route("/api/search/semantic", get(semantic_search))
         .route("/api/timeline", get(timeline))
         .route("/api/stats", get(stats))
         .route("/api/apps", get(apps))
         .route("/api/capture/{id}", get(capture))
         .route("/api/frame/{id}", get(frame))
+        .route("/api/embeddings/status", get(embeddings_status))
         .with_state(state)
 }
 
@@ -206,4 +211,43 @@ async fn frame(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<
         bytes,
     )
         .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct SemanticSearchParams {
+    #[serde(default)]
+    q: String,
+    limit: Option<usize>,
+}
+
+async fn semantic_search(
+    State(state): State<AppState>,
+    Query(p): Query<SemanticSearchParams>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let Some(store) = state.embeddings_store else {
+        return Ok(Json(json!({"error": "embeddings uitgeschakeld", "hits": []})));
+    };
+    let Some(provider) = state.embeddings_provider else {
+        return Ok(Json(json!({"error": "geen embedding provider", "hits": []})));
+    };
+    if p.q.trim().is_empty() {
+        return Ok(Json(json!({"hits": [], "count": 0})));
+    }
+    let limit = p.limit.unwrap_or(20).clamp(1, 100);
+    let q = p.q.clone();
+    let emb = tokio::task::spawn_blocking(move || provider.embed(&[q]))
+        .await
+        .map_err(|e| anyhow::anyhow!("embed panicked: {e}"))??;
+    let hits = store.search(emb.into_iter().next().unwrap(), limit).await?;
+    Ok(Json(json!({"hits": hits, "count": hits.len()})))
+}
+
+async fn embeddings_status(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let Some(store) = state.embeddings_store else {
+        return Ok(Json(json!({"enabled": false, "count": 0})));
+    };
+    match store.count().await {
+        Ok(n) => Ok(Json(json!({"enabled": true, "count": n, "available": store.is_available()}))),
+        Err(e) => Ok(Json(json!({"enabled": true, "error": e.to_string()}))),
+    }
 }

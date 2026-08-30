@@ -19,6 +19,7 @@ pub struct Config {
     pub filter: FilterConfig,
     pub storage: StorageConfig,
     pub server: ServerConfig,
+    pub embeddings: EmbeddingsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +221,48 @@ impl Default for StorageConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingsConfig {
+    /// Semantische index aan/uit. Uit = capture werkt normaal, alleen vector zoek is unavailable.
+    pub enabled: bool,
+    /// Provider: "mock" (tests) of "fastembed" (lokaal ONNX). Voor v1 alleen mock actief.
+    pub provider: String,
+    /// Model naam voor provenance (bv. intfloat/multilingual-e5-small).
+    pub model: String,
+    /// Verwachte vector dimensies (voor pgvector schema).
+    pub dimensions: usize,
+    /// PostgreSQL connectie-string. Leeg = uit env `CHRONICLE_POSTGRES_URL` of `DATABASE_URL`.
+    pub postgres_url: Option<String>,
+    /// Batch grootte voor embedding aanroepen.
+    pub batch_size: usize,
+    /// Poll interval voor async indexer (secs).
+    pub poll_interval_secs: f64,
+    /// Max chars per semantic document (afkappen, deterministisch).
+    pub max_content_chars: usize,
+    /// Min chars om te embedden (filter ruis).
+    pub min_chars: usize,
+    /// Venster in seconden voor grouping per segment.
+    pub window_secs: i64,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "mock".into(),
+            model: "multilingual-e5-small-mock".into(),
+            dimensions: 384,
+            postgres_url: None,
+            batch_size: 32,
+            poll_interval_secs: 5.0,
+            max_content_chars: 4000,
+            min_chars: 40,
+            window_secs: 120,
+        }
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -296,7 +339,31 @@ impl Config {
         if self.uia.timeout_ms == 0 || self.uia.timeout_ms > 30_000 {
             return Err(anyhow!("uia.timeout_ms moet 1..30000 zijn"));
         }
+        if self.embeddings.enabled {
+            if self.embeddings.dimensions == 0 || self.embeddings.dimensions > 4096 {
+                return Err(anyhow!("embeddings.dimensions moet 1..4096 zijn"));
+            }
+            if self.embeddings.batch_size == 0 || self.embeddings.batch_size > 512 {
+                return Err(anyhow!("embeddings.batch_size moet 1..512 zijn"));
+            }
+            if self.embeddings.max_content_chars < 100 || self.embeddings.max_content_chars > 20000 {
+                return Err(anyhow!("embeddings.max_content_chars moet 100..20000 zijn"));
+            }
+        }
         Ok(())
+    }
+
+    /// Opgeloste postgres URL met env fallback.
+    pub fn embeddings_postgres_url(&self) -> Option<String> {
+        if let Some(url) = &self.embeddings.postgres_url {
+            if !url.trim().is_empty() {
+                return Some(url.clone());
+            }
+        }
+        std::env::var("CHRONICLE_POSTGRES_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("DATABASE_URL").ok().filter(|s| !s.trim().is_empty()))
     }
 
     /// Schrijft de huidige config weg, maakt tussenliggende mappen aan.

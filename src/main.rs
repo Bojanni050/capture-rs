@@ -6,6 +6,7 @@
 mod capture;
 mod com;
 mod config;
+mod embeddings;
 mod filter;
 mod ocr;
 mod pipeline;
@@ -70,6 +71,9 @@ enum Command {
         /// Toon de volledige tekst in plaats van een fragment.
         #[arg(long)]
         full: bool,
+        /// Gebruik semantische (embedding) zoek in plaats van exact FTS5.
+        #[arg(long)]
+        semantic: bool,
     },
     /// Samenvatting van wat er is vastgelegd en weggefilterd.
     Stats {
@@ -99,6 +103,34 @@ enum Command {
         #[arg(long)]
         init: bool,
     },
+    /// Semantische embedding index (lokaal, optioneel).
+    Embeddings {
+        #[command(subcommand)]
+        action: EmbeddingsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum EmbeddingsCommand {
+    /// Toon status van de semantische index.
+    Status,
+    /// Herbouw de index uit SQLite (deterministisch, hervatbaar).
+    Rebuild {
+        /// Hoe ver terug herbouwen (default: alles).
+        #[arg(long, default_value = "45d")]
+        since: String,
+        /// Max captures in één run (0 = alles).
+        #[arg(long, default_value_t = 0)]
+        limit: i64,
+    },
+    /// Verwijder oude semantische documenten.
+    Purge {
+        /// Verwijder documenten ouder dan dit.
+        #[arg(long)]
+        older_than: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -118,16 +150,28 @@ async fn main() -> Result<()> {
             since,
             limit,
             full,
-        } => cmd_search(cfg, query.join(" "), app, kind, &since, limit, full),
+            semantic,
+        } => {
+            if semantic {
+                cmd_search_semantic(cfg, query.join(" "), app, &since, limit).await
+            } else {
+                cmd_search(cfg, query.join(" "), app, kind, &since, limit, full)
+            }
+        }
         Command::Stats { since } => cmd_stats(cfg, &since),
         Command::Purge {
             older_than,
             frames_older_than,
             yes,
             vacuum,
-        } => cmd_purge(cfg, older_than, frames_older_than, yes, vacuum),
+        } => cmd_purge(cfg, older_than, frames_older_than, yes, vacuum).await,
         Command::Doctor => cmd_doctor(cfg, &cfg_path),
         Command::Config { init } => cmd_config(cfg, &cfg_path, init),
+        Command::Embeddings { action } => match action {
+            EmbeddingsCommand::Status => cmd_embeddings_status(cfg).await,
+            EmbeddingsCommand::Rebuild { since, limit } => cmd_embeddings_rebuild(cfg, &since, limit).await,
+            EmbeddingsCommand::Purge { older_than, yes } => cmd_embeddings_purge(cfg, older_than, yes).await,
+        },
     }
 }
 
@@ -159,16 +203,53 @@ fn open_store(cfg: &Config) -> Result<(Arc<Db>, Arc<FrameStore>)> {
 async fn cmd_start(cfg: Config, no_server: bool) -> Result<()> {
     let (db, frames) = open_store(&cfg)?;
 
+    // Bouw server state mét embeddings store (optioneel) voor API.
+    let embeddings_store = if cfg.embeddings.enabled {
+        Some(embeddings::make_store(&cfg))
+    } else {
+        None
+    };
+    let embeddings_provider = if cfg.embeddings.enabled {
+        Some(embeddings::make_provider(&cfg))
+    } else {
+        None
+    };
+
     if !no_server && cfg.server.enabled {
         let state = server::AppState {
             db: Arc::clone(&db),
             frames: Arc::clone(&frames),
+            embeddings_store: embeddings_store.clone(),
+            embeddings_provider: embeddings_provider.clone(),
         };
         match server::serve(state, &cfg.server.bind, cfg.server.port).await {
             Ok(addr) => tracing::info!("webinterface op http://{addr}"),
             Err(e) => tracing::error!(error = %e, "webserver kon niet starten"),
         }
     }
+
+    // Start async semantic indexer (indien enabled) — faalt nooit capture.
+    // Deel store/provider met server zodat beide dezelfde vector index zien (cruciaal voor InMemory).
+    let indexer_handle = if cfg.embeddings.enabled {
+        let store = embeddings_store.clone().expect("enabled");
+        let provider = embeddings_provider.clone().expect("enabled");
+        let indexer = embeddings::Indexer::new(
+            cfg.clone(),
+            Arc::clone(&db),
+            store,
+            provider,
+            None,
+        );
+        let (idx_tx, idx_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            if let Err(e) = indexer.run(idx_rx).await {
+                tracing::warn!(error = %e, "embeddings indexer gestopt met fout");
+            }
+        });
+        Some((handle, idx_tx))
+    } else {
+        None
+    };
 
     let mut pipeline = pipeline::Pipeline::new(cfg, Arc::clone(&db), Arc::clone(&frames))?;
     tracing::info!(schermen = %pipeline.monitors(), "opname gestart — Ctrl+C om te stoppen");
@@ -180,12 +261,35 @@ async fn cmd_start(cfg: Config, no_server: bool) -> Result<()> {
         }
     });
 
-    pipeline.run(rx).await
+    let res = pipeline.run(rx).await;
+
+    // Shutdown indexer netjes.
+    if let Some((handle, idx_tx)) = indexer_handle {
+        let _ = idx_tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    res
 }
 
 async fn cmd_serve(cfg: Config) -> Result<()> {
     let (db, frames) = open_store(&cfg)?;
-    let state = server::AppState { db, frames };
+    let embeddings_store = if cfg.embeddings.enabled {
+        Some(embeddings::make_store(&cfg))
+    } else {
+        None
+    };
+    let embeddings_provider = if cfg.embeddings.enabled {
+        Some(embeddings::make_provider(&cfg))
+    } else {
+        None
+    };
+    let state = server::AppState {
+        db,
+        frames,
+        embeddings_store,
+        embeddings_provider,
+    };
     let addr = server::serve(state, &cfg.server.bind, cfg.server.port).await?;
     println!("Webinterface draait op http://{addr} — Ctrl+C om te stoppen.");
     tokio::signal::ctrl_c().await?;
@@ -302,7 +406,7 @@ fn cmd_stats(cfg: Config, since: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_purge(
+async fn cmd_purge(
     cfg: Config,
     older_than: Option<String>,
     frames_older_than: Option<String>,
@@ -359,6 +463,18 @@ fn cmd_purge(
         "{} captures verwijderd, {} afbeeldingen van schijf.",
         report.captures_deleted, verwijderd
     );
+
+    // Ook semantische documenten opruimen volgens zelfde cutoff.
+    if cfg.embeddings.enabled {
+        if let Some(cutoff) = captures_before {
+            let store = embeddings::make_store(&cfg);
+            match store.delete_before(cutoff).await {
+                Ok(n) if n > 0 => println!("{n} semantische documenten verwijderd."),
+                Ok(_) => {},
+                Err(e) => tracing::warn!(error = %e, "semantic purge faalde — PG unavailable?"),
+            }
+        }
+    }
 
     if vacuum {
         db.vacuum()?;
@@ -532,6 +648,173 @@ fn cmd_config(cfg: Config, path: &std::path::Path, init: bool) -> Result<()> {
         println!("# (bestaat nog niet — dit zijn de defaults; `chronicle config --init` schrijft ze weg)");
     }
     println!("{}", toml::to_string_pretty(&cfg)?);
+    Ok(())
+}
+
+async fn cmd_search_semantic(
+    cfg: Config,
+    query: String,
+    app: Option<String>,
+    since: &str,
+    limit: i64,
+) -> Result<()> {
+    if query.trim().is_empty() {
+        println!("Geef een zoekterm op voor semantisch zoeken.");
+        return Ok(());
+    }
+    if !cfg.embeddings.enabled {
+        println!("Semantisch zoeken is uitgeschakeld (embeddings.enabled = false).");
+        println!("Zet het aan in {} of via --config.", Config::default_path()?.display());
+        return Ok(());
+    }
+    let store = embeddings::make_store(&cfg);
+    let provider = embeddings::make_provider(&cfg);
+
+    // Check beschikbaarheid
+    if let Err(e) = store.ensure_schema().await {
+        println!("Vector store niet beschikbaar: {e}");
+        println!("Controleer postgres_url en of pgvector geïnstalleerd is.");
+        return Ok(());
+    }
+
+    let from = Local::now().timestamp() - parse_duration(since)?;
+    // Embed query
+    let q_emb = tokio::task::spawn_blocking({
+        let provider = provider.clone();
+        let q = query.clone();
+        move || provider.embed(&[q])
+    })
+    .await
+    .map_err(|e| anyhow!("embed task panicked: {e}"))??;
+
+    let hits = store.search(q_emb[0].clone(), limit.max(1) as usize).await?;
+    if hits.is_empty() {
+        println!("Niets gevonden (semantisch).");
+        return Ok(());
+    }
+    let color = std::io::stdout().is_terminal();
+    for hit in hits.iter().filter(|h| app.as_deref().is_none_or(|a| h.document.application == a))
+        .filter(|h| h.document.start_time >= from)
+        .take(limit as usize)
+    {
+        let when = Local
+            .timestamp_opt(hit.document.start_time, 0)
+            .single()
+            .map(|t| t.format("%d-%m %H:%M").to_string())
+            .unwrap_or_default();
+        println!(
+            "\n{when}  {}  [semantic {:.2}]  {} ({} captures)",
+            hit.document.application,
+            hit.score,
+            truncate(&hit.document.title, 60),
+            hit.document.source_capture_ids.len()
+        );
+        let snippet = hit.snippet.replace('\n', "\n  ");
+        println!("  {}", markeer(&snippet, color));
+        if let Some(first) = hit.document.source_capture_ids.first() {
+            println!("  → http://{}:{}/#{}", cfg.server.bind, cfg.server.port, first);
+        }
+        println!("  provenance: {}", hit.document.source_capture_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","));
+    }
+    Ok(())
+}
+
+async fn cmd_embeddings_status(cfg: Config) -> Result<()> {
+    println!("Embeddings enabled: {}", cfg.embeddings.enabled);
+    println!("Provider: {} ({})", cfg.embeddings.provider, cfg.embeddings.model);
+    println!("Dimensions: {}", cfg.embeddings.dimensions);
+    println!(
+        "Postgres: {}",
+        cfg.embeddings_postgres_url().unwrap_or_else(|| "(geen)".into())
+    );
+    if !cfg.embeddings.enabled {
+        println!("(uitgeschakeld — geen indexering)");
+        return Ok(());
+    }
+    let store = embeddings::make_store(&cfg);
+    match store.ensure_schema().await {
+        Ok(_) => println!("Vector store: beschikbaar"),
+        Err(e) => {
+            println!("Vector store: niet beschikbaar — {e}");
+            return Ok(());
+        }
+    }
+    let n = store.count().await.unwrap_or(0);
+    println!("Documenten: {n}");
+    // SQLite kant
+    let (db, _) = open_store(&cfg)?;
+    let total = db.stats(0, chrono::Utc::now().timestamp())?.captures;
+    println!("SQLite captures totaal: {total}");
+    Ok(())
+}
+
+async fn cmd_embeddings_rebuild(cfg: Config, since: &str, limit: i64) -> Result<()> {
+    if !cfg.embeddings.enabled {
+        return Err(anyhow!("embeddings.enabled is false — zet aan in config"));
+    }
+    let (db, _) = open_store(&cfg)?;
+    let store = embeddings::make_store(&cfg);
+    let provider = embeddings::make_provider(&cfg);
+    store.ensure_schema().await?;
+
+    let from = chrono::Utc::now().timestamp() - parse_duration(since)?;
+    // Lees captures sinds `from` — we gebruiken fetch met filter op ts, niet alleen id.
+    // Voor eenvoud: lees alle en filter op ts.
+    let all = tokio::task::spawn_blocking({
+        let db = Arc::clone(&db);
+        move || db.fetch_captures_since(0)
+    })
+    .await
+    .map_err(|e| anyhow!("fetch panicked: {e}"))??;
+
+    let filtered: Vec<_> = all
+        .into_iter()
+        .filter(|c| c.ts >= from)
+        .take(if limit > 0 { limit as usize } else { usize::MAX })
+        .collect();
+
+    println!("Gevonden {} captures sinds {}, bouw documenten...", filtered.len(), since);
+
+    let docs = embeddings::build_documents(
+        &filtered,
+        cfg.embeddings.window_secs,
+        cfg.embeddings.max_content_chars,
+        cfg.embeddings.min_chars,
+        provider.model_name(),
+        provider.dimensions(),
+    );
+    println!("Gebouwd {} semantic documents (dedup, window {}s)", docs.len(), cfg.embeddings.window_secs);
+    if docs.is_empty() {
+        println!("Niets te indexeren.");
+        return Ok(());
+    }
+    let texts: Vec<String> = docs.iter().map(|d| d.content.clone()).collect();
+    let embs = tokio::task::spawn_blocking(move || provider.embed(&texts))
+        .await
+        .map_err(|e| anyhow!("embed panicked: {e}"))??;
+    let n = store.upsert(docs, embs).await?;
+    println!("{n} documenten geïndexeerd.");
+    Ok(())
+}
+
+async fn cmd_embeddings_purge(cfg: Config, older_than: Option<String>, yes: bool) -> Result<()> {
+    let cutoff = if let Some(spec) = older_than {
+        chrono::Utc::now().timestamp() - parse_duration(&spec)?
+    } else if cfg.storage.retention_days > 0 {
+        chrono::Utc::now().timestamp() - cfg.storage.retention_days as i64 * 86_400
+    } else {
+        println!("Geen retentie ingesteld; geef --older-than op.");
+        return Ok(());
+    };
+
+    let store = embeddings::make_store(&cfg);
+    if !yes {
+        let n = store.count().await.unwrap_or(0);
+        println!("Zou documenten verwijderen vóór {} (nu {n} docs). Voeg --yes toe.", fmt_ts(cutoff));
+        return Ok(());
+    }
+    let n = store.delete_before(cutoff).await?;
+    println!("{n} semantische documenten verwijderd vóór {}.", fmt_ts(cutoff));
     Ok(())
 }
 
