@@ -394,6 +394,10 @@ impl Config {
         Ok(self.resolved_data_dir()?.join("chronicle.db"))
     }
 
+    pub fn lock_path(&self) -> Result<PathBuf> {
+        Ok(self.resolved_data_dir()?.join("chronicle.lock"))
+    }
+
     pub fn frames_dir(&self) -> Result<PathBuf> {
         let dir = self.resolved_data_dir()?.join("frames");
         std::fs::create_dir_all(&dir)?;

@@ -8,6 +8,7 @@ mod com;
 mod config;
 mod embeddings;
 mod filter;
+mod lock;
 mod ocr;
 mod pipeline;
 mod server;
@@ -212,6 +213,11 @@ fn open_store(cfg: &Config) -> Result<(Arc<Db>, Arc<FrameStore>)> {
 }
 
 async fn cmd_start(cfg: Config, no_server: bool) -> Result<()> {
+    // Moet vóór `open_store` gebeuren: twee `start`-instanties die allebei
+    // hun eigen migratie/WAL-initialisatie op dezelfde database doen, is
+    // precies wat de database eerder corrumpeerde (zie `lock.rs`).
+    let _lock = lock::InstanceLock::acquire(&cfg.lock_path()?)?;
+
     let (db, frames) = open_store(&cfg)?;
 
     // Bouw server state mét embeddings store (optioneel) voor API.
