@@ -10,8 +10,9 @@
 //!                                  │       → shot overslaan  rekken
 //!                                  │
 //!                             beperkt tot het rechthoek van het voorgrondvenster: content
-//!                             van andere, overlappende vensters komt zo nooit in OCR of
-//!                             een bewaard beeld terecht.
+//!                             beperkt de opname tot het actieve venster. Dit
+//!                             is geen occlusie-masker: een always-on-top
+//!                             pop-up binnen dezelfde rechthoek blijft zichtbaar.
 //! ```
 //!
 //! Drie tekstbronnen, in volgorde van betrouwbaarheid:
@@ -185,6 +186,11 @@ impl Pipeline {
                 (None, rx)
             }
         };
+        // UIA-events zijn aanvullend op de globale focus-hook: ze wekken de
+        // pipeline bij inhoudswijzigingen binnen het actieve venster. Een
+        // afwezige receiver wordt hieronder een pending future, zodat de
+        // periodieke fallback altijd blijft werken.
+        let mut uia_changes = self.uia.as_ref().and_then(UiaService::subscribe_events);
 
         loop {
             let idle = idle_seconds();
@@ -219,6 +225,19 @@ impl Pipeline {
                     // nodig om stabiel te worden.
                     tokio::time::sleep(FOREGROUND_DEBOUNCE).await;
                     while foreground_changes.try_recv().is_ok() {}
+                }
+                _ = async {
+                    match &mut uia_changes {
+                        Some(receiver) => {
+                            let _ = receiver.changed().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // De UIA-zender coalescet zelf alle events in deze
+                    // periode; wachten voorkomt een capture midden in een
+                    // reeks DOM-/layoutwijzigingen.
+                    tokio::time::sleep(FOREGROUND_DEBOUNCE).await;
                 }
             }
         }
@@ -301,10 +320,11 @@ impl Pipeline {
 
         // Elke shot bijsnijden tot het zichtbare rechthoek van het
         // voorgrondvenster (opgehaald vlak vóór de screenshot hierboven):
-        // content van andere, overlappende vensters mag nooit in OCR, de
-        // beeldhash of een bewaard beeld terechtkomen. Kunnen we de grenzen
-        // niet bepalen (DWM weigert), dan gebruiken we liever de hele shot
-        // dan de capture over te slaan.
+        // beperkt de kans dat andere vensters in OCR, de beeldhash of een
+        // bewaard beeld terechtkomen. Dit is geen occlusie-masker: een
+        // always-on-top pop-up binnen dezelfde rechthoek is nog zichtbaar.
+        // Kunnen we de grenzen niet bepalen (DWM weigert), dan gebruiken we
+        // liever de hele shot dan de capture over te slaan.
         for shot in shots {
             let image = match win_rect {
                 Some(rect) => match crop_to_window(&shot.image, shot.x, shot.y, rect) {

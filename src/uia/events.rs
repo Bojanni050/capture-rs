@@ -19,7 +19,7 @@
 //! handler-registraties — leven uitsluitend op deze ene thread: STA-objecten
 //! zijn apartment-gebonden en mogen niet cross-thread gedeeld worden zonder
 //! marshaling. Andere threads raken ze daarom nooit rechtstreeks aan, alleen
-//! via `PostMessageW` (commando's erin) en het `Sender<UiaEvent>`-kanaal
+//! via `PostMessageW` (commando's erin) en een coalescende `watch`-zender
 //! (events eruit).
 //!
 //! **Eén thread per geregistreerd venster, niet één gedeelde thread.**
@@ -40,9 +40,9 @@
 
 use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 use windows::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, SAFEARRAY,
@@ -65,17 +65,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, Ref, implement};
 
-/// Berichten die van de COM callback naar `uia::UiaService` gestuurd worden.
-#[derive(Debug, Clone)]
-pub enum UiaEvent {
-    StructureChanged {
-        hwnd: isize,
-        change_type: StructureChangeType,
-    },
-    PropertyChanged {
-        hwnd: isize,
-        property_id: UIA_PROPERTY_ID,
-    },
+/// Lichtgewicht, samenvattend signaal van een UIA-event. `watch` bewaart
+/// alleen de laatste versie: duizend events vóór de volgende capture zijn nog
+/// steeds precies één reden om opnieuw te lezen, nooit duizend queued jobs.
+#[derive(Clone)]
+pub struct EventSignal(watch::Sender<u64>);
+
+impl EventSignal {
+    pub fn new(sender: watch::Sender<u64>) -> Self {
+        Self(sender)
+    }
+
+    fn notify(&self) {
+        self.0.send_modify(|version| *version = version.wrapping_add(1));
+    }
 }
 
 /// Bewaakt of de STA-thread vastzit in `ElementFromHandle` of
@@ -128,8 +131,7 @@ fn now_millis() -> u64 {
 
 #[implement(IUIAutomationStructureChangedEventHandler)]
 struct StructureChangedHandler {
-    sender: Sender<UiaEvent>,
-    hwnd: isize,
+    signal: EventSignal,
 }
 
 impl IUIAutomationStructureChangedEventHandler_Impl for StructureChangedHandler_Impl {
@@ -137,23 +139,17 @@ impl IUIAutomationStructureChangedEventHandler_Impl for StructureChangedHandler_
     fn HandleStructureChangedEvent(
         &self,
         _sender: Ref<IUIAutomationElement>,
-        changeType: StructureChangeType,
+        _changeType: StructureChangeType,
         _runtimeId: *const SAFEARRAY,
     ) -> windows::core::Result<()> {
-        let event = UiaEvent::StructureChanged {
-            hwnd: self.hwnd,
-            change_type: changeType,
-        };
-        // Channel vol/gesloten is geen COM-fout — gewoon Ok terug.
-        let _ = self.sender.send(event);
+        self.signal.notify();
         Ok(())
     }
 }
 
 #[implement(IUIAutomationPropertyChangedEventHandler)]
 struct PropertyChangedHandler {
-    sender: Sender<UiaEvent>,
-    hwnd: isize,
+    signal: EventSignal,
 }
 
 impl IUIAutomationPropertyChangedEventHandler_Impl for PropertyChangedHandler_Impl {
@@ -161,14 +157,10 @@ impl IUIAutomationPropertyChangedEventHandler_Impl for PropertyChangedHandler_Im
     fn HandlePropertyChangedEvent(
         &self,
         _sender: Ref<IUIAutomationElement>,
-        propertyId: UIA_PROPERTY_ID,
+        _propertyId: UIA_PROPERTY_ID,
         _newValue: &VARIANT,
     ) -> windows::core::Result<()> {
-        let event = UiaEvent::PropertyChanged {
-            hwnd: self.hwnd,
-            property_id: propertyId,
-        };
-        let _ = self.sender.send(event);
+        self.signal.notify();
         Ok(())
     }
 }
@@ -184,7 +176,7 @@ impl IUIAutomationPropertyChangedEventHandler_Impl for PropertyChangedHandler_Im
 struct ThreadState {
     automation: IUIAutomation,
     cache: IUIAutomationCacheRequest,
-    event_sender: Sender<UiaEvent>,
+    event_signal: EventSignal,
     structure_handlers: std::collections::HashMap<isize, IUIAutomationStructureChangedEventHandler>,
     property_handlers: std::collections::HashMap<isize, IUIAutomationPropertyChangedEventHandler>,
     busy: BusySince,
@@ -215,8 +207,7 @@ impl ThreadState {
             .context("venster heeft geen accessibility-element")?;
 
         let sc_handler: IUIAutomationStructureChangedEventHandler = StructureChangedHandler {
-            sender: self.event_sender.clone(),
-            hwnd: hwnd_val,
+            signal: self.event_signal.clone(),
         }
         .into();
         unsafe {
@@ -227,8 +218,7 @@ impl ThreadState {
         self.structure_handlers.insert(hwnd_val, sc_handler);
 
         let pc_handler: IUIAutomationPropertyChangedEventHandler = PropertyChangedHandler {
-            sender: self.event_sender.clone(),
-            hwnd: hwnd_val,
+            signal: self.event_signal.clone(),
         }
         .into();
         let props = [UIA_NamePropertyId, UIA_ControlTypePropertyId];
@@ -349,7 +339,7 @@ fn state_from<'a>(hwnd: HWND) -> Option<&'a mut ThreadState> {
 
 /// Draait op de toegewijde thread: COM als STA initialiseren, het venster
 /// aanmaken, en dan de message-loop pompen tot `WM_UIA_SHUTDOWN`.
-fn run(event_sender: Sender<UiaEvent>, busy: BusySince, ready: std::sync::mpsc::Sender<Result<isize>>) {
+fn run(event_signal: EventSignal, busy: BusySince, ready: std::sync::mpsc::Sender<Result<isize>>) {
     let outcome = (|| -> Result<HWND> {
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED)
@@ -374,7 +364,7 @@ fn run(event_sender: Sender<UiaEvent>, busy: BusySince, ready: std::sync::mpsc::
         let state = Box::new(ThreadState {
             automation,
             cache,
-            event_sender,
+            event_signal,
             structure_handlers: std::collections::HashMap::new(),
             property_handlers: std::collections::HashMap::new(),
             busy,
@@ -462,9 +452,10 @@ fn run(event_sender: Sender<UiaEvent>, busy: BusySince, ready: std::sync::mpsc::
 /// boomlezing gemeten hebben (`reader.rs`) — deze twee doen veel minder werk
 /// (geen boomwandeling), dus dit is al een royale marge.
 const STUCK_THRESHOLD: Duration = Duration::from_secs(5);
-/// Hoe lang `Drop` op een nette afsluiting wacht voordat hij de thread
-/// loslaat in plaats van het afsluiten van het hele proces te laten hangen.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Hoeveel registratie-threads hoogstens tegelijk mogen vastzitten. Daarna
+/// schakelen we UIA-events tijdelijk uit voor nieuwe vensters; polling blijft
+/// actief en er ontstaan geen onbeperkte threads.
+const MAX_ABANDONED_THREADS: usize = 2;
 
 /// Eén draaiende message-only thread, toegewijd aan precies één venster voor
 /// de rest van zijn leven. `hwnd` is het adres van *deze* thread om naartoe
@@ -510,13 +501,33 @@ impl WindowThread {
     }
 }
 
+/// Vraagt afsluiten aan en ruimt de join-handle op een reaper-thread op. Een
+/// werkelijk vastgelopen COM-aanroep kan zo nooit de pipeline blokkeren; het
+/// aantal van zulke gevallen wordt tegelijk begrensd door `switch_window`.
+fn retire_window_thread(mut thread: WindowThread, abandoned: Arc<AtomicUsize>) {
+    let was_stuck = thread.busy.stuck_for().is_some();
+    thread.request_shutdown();
+    let Some(handle) = thread.join_handle.take() else {
+        return;
+    };
+    if was_stuck {
+        abandoned.fetch_add(1, Ordering::Relaxed);
+    }
+    std::thread::spawn(move || {
+        let _ = handle.join();
+        if was_stuck {
+            abandoned.fetch_sub(1, Ordering::Relaxed);
+        }
+    });
+}
+
 /// Start een nieuwe thread die zijn eigen `IUIAutomation` opbouwt en, zodra
 /// zijn message-only venster bestaat, een registratie voor `target` post
 /// (fire-and-forget: deze functie wacht nooit op die registratie zelf, alleen
 /// op het — snelle, deadline-loze-COM-aanroep-vrije — aanmaken van het
 /// venster). `target = None` is de eenmalige proefopstart in `start()`: die
 /// bevestigt dat COM/STA hier werkt, zonder iets te registreren.
-fn spawn_window_thread(event_sender: Sender<UiaEvent>, target: Option<HWND>) -> Result<WindowThread> {
+fn spawn_window_thread(event_signal: EventSignal, target: Option<HWND>) -> Result<WindowThread> {
     let target_val = target.map(|h| h.0 as isize);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<isize>>();
     let busy = BusySince::new();
@@ -524,7 +535,7 @@ fn spawn_window_thread(event_sender: Sender<UiaEvent>, target: Option<HWND>) -> 
 
     let join_handle = std::thread::Builder::new()
         .name("chronicle-uia-events".into())
-        .spawn(move || run(event_sender, busy_for_thread, ready_tx))
+        .spawn(move || run(event_signal, busy_for_thread, ready_tx))
         .context("uia-events thread starten mislukt")?;
 
     let hwnd = ready_rx
@@ -552,12 +563,14 @@ fn spawn_window_thread(event_sender: Sender<UiaEvent>, target: Option<HWND>) -> 
 /// worden. Zie de moduledocumentatie bovenaan voor waarom dit per venster een
 /// eigen thread is in plaats van één gedeelde.
 pub struct UiaEventThread {
-    event_sender: Sender<UiaEvent>,
+    event_signal: EventSignal,
     current: std::sync::Mutex<Option<WindowThread>>,
+    abandoned: Arc<AtomicUsize>,
 }
 
 impl UiaEventThread {
-    pub fn start(event_sender: Sender<UiaEvent>) -> Result<Self> {
+    pub fn start(event_sender: watch::Sender<u64>) -> Result<Self> {
+        let event_signal = EventSignal::new(event_sender);
         // Eenmalige proefopstart: bevestigt dat COM/STA en de vensterklasse
         // op dit systeem werken. Lukt dit niet, dan valt de aanroeper terug
         // op alleen polling — precies zoals vóór deze aanpak, alleen faalt
@@ -565,12 +578,13 @@ impl UiaEventThread {
         // voorgrondwissel opnieuw. Lukt het wel, dan gooien we deze
         // wegwerp-thread meteen weg; pas de eerste `switch_window` start de
         // thread die er echt toe doet.
-        let probe = spawn_window_thread(event_sender.clone(), None)?;
+        let probe = spawn_window_thread(event_signal.clone(), None)?;
         probe.request_shutdown();
 
         Ok(Self {
-            event_sender,
+            event_signal,
             current: std::sync::Mutex::new(None),
+            abandoned: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -582,14 +596,32 @@ impl UiaEventThread {
     /// hangende registratie voor het vorige venster nooit de events van dit
     /// venster tegenhoudt.
     pub fn switch_window(&self, hwnd: HWND) -> Result<()> {
-        let new = spawn_window_thread(self.event_sender.clone(), Some(hwnd))?;
+        // Een provider kan in registratie blijven hangen. Laat hoogstens één
+        // al-vastgelopen huidige thread plaatsmaken wanneer er al één oude
+        // hangt; daarna valt deze optimalisatie terug op polling in plaats van
+        // bij elke focuswissel nog een thread te verliezen.
+        let current_is_stuck = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|thread| thread.busy.stuck_for().is_some());
+        if current_is_stuck
+            && self.abandoned.load(Ordering::Relaxed) >= MAX_ABANDONED_THREADS - 1
+        {
+            return Err(anyhow!(
+                "te veel vastgelopen UIA-eventregistraties; terugvallen op polling"
+            ));
+        }
+
+        let new = spawn_window_thread(self.event_signal.clone(), Some(hwnd))?;
         let old = self
             .current
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .replace(new);
         if let Some(old) = old {
-            old.request_shutdown();
+            retire_window_thread(old, Arc::clone(&self.abandoned));
         }
         Ok(())
     }
@@ -606,7 +638,7 @@ impl UiaEventThread {
 
 impl Drop for UiaEventThread {
     fn drop(&mut self) {
-        let Some(mut current) = self
+        let Some(current) = self
             .current
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -614,63 +646,22 @@ impl Drop for UiaEventThread {
         else {
             return;
         };
-        current.request_shutdown();
-
-        let Some(handle) = current.join_handle.take() else {
-            return;
-        };
-        // Zat de thread al vast in een providerloze COM-aanroep, dan ligt het
-        // shutdown-bericht achter in de wachtrij te wachten tot die aanroep
-        // — die geen deadline heeft — ooit teruggeeft. Het afsluiten van het
-        // hele proces mag daar nooit op wachten, dus `join()` gebeurt op een
-        // eigen thread en we geven het een ruime marge; loopt die af, dan
-        // laten we de thread los in plaats van te blijven hangen.
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let _joiner = std::thread::spawn(move || {
-            let _ = handle.join();
-            let _ = done_tx.send(());
-        });
-        if done_rx.recv_timeout(SHUTDOWN_GRACE).is_err() {
-            tracing::warn!(
-                seconden = SHUTDOWN_GRACE.as_secs(),
-                "uia-eventthread reageerde niet op afsluiten; losgelaten"
-            );
-        }
-        // `_joiner` laten we bewust los: die rondt vanzelf af zodra de
-        // onderliggende thread dat doet, of nooit — dat blokkeert in geen van
-        // beide gevallen het proces dat nu al aan het afsluiten is.
+        retire_window_thread(current, Arc::clone(&self.abandoned));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
 
     #[test]
-    fn test_event_types() {
-        let e1 = UiaEvent::StructureChanged {
-            hwnd: 123,
-            change_type: StructureChangeType(0),
-        };
-        let e2 = UiaEvent::PropertyChanged {
-            hwnd: 456,
-            property_id: UIA_NamePropertyId,
-        };
-        assert!(matches!(e1, UiaEvent::StructureChanged { .. }));
-        assert!(matches!(e2, UiaEvent::PropertyChanged { .. }));
-    }
-
-    #[test]
-    fn test_event_sender_via_channel() {
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(UiaEvent::StructureChanged {
-                hwnd: 123,
-                change_type: StructureChangeType(0),
-            })
-            .unwrap();
-        assert!(receiver.try_recv().is_ok());
+    fn event_signaal_coalescet_wijzigingen() {
+        let (sender, receiver) = watch::channel(0);
+        let signal = EventSignal::new(sender);
+        signal.notify();
+        signal.notify();
+        signal.notify();
+        assert_eq!(*receiver.borrow(), 3);
     }
 
     // Deze vier testen de horlogelogica zonder COM of een echte thread nodig

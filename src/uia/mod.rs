@@ -28,13 +28,12 @@ pub mod reader;
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use windows::Win32::Foundation::HWND;
 
 use crate::config::UiaConfig;
-use events::{UiaEvent, UiaEventThread};
+use events::UiaEventThread;
 use reader::{UiaReader, WindowRead};
 
 struct Job {
@@ -69,8 +68,10 @@ pub struct UiaService {
     /// STA-thread die UIA-events registreert en ontvangt. Sluit zichzelf
     /// netjes af zodra dit veld valt (`UiaEventThread::drop`).
     pub(crate) event_manager: Option<UiaEventThread>,
-    /// Ontvanger voor UIA events.
-    event_receiver: Option<std_mpsc::Receiver<UiaEvent>>,
+    /// Versieteller voor UIA-events. `watch` coalescet bursts tot één
+    /// "er is iets gewijzigd"-signaal, dus een druk document kan geen
+    /// onbeperkte wachtrij opbouwen.
+    event_signal: Option<watch::Sender<u64>>,
 }
 
 impl UiaService {
@@ -112,10 +113,10 @@ impl UiaService {
         // zijn eigen IUIAutomation-instantie op — COM-objecten zijn
         // apartment-gebonden en kunnen niet gedeeld worden met de MTA-thread
         // hierboven, ook niet via clone().
-        let (event_manager, event_receiver) = if cfg.event_driven {
-            let (event_sender, event_receiver) = std_mpsc::channel();
-            match UiaEventThread::start(event_sender) {
-                Ok(thread) => (Some(thread), Some(event_receiver)),
+        let (event_manager, event_signal) = if cfg.event_driven {
+            let (event_signal, _initial_receiver) = watch::channel(0u64);
+            match UiaEventThread::start(event_signal.clone()) {
+                Ok(thread) => (Some(thread), Some(event_signal)),
                 Err(e) => {
                     tracing::warn!(error = %e, "uia-eventthread niet beschikbaar; alleen polling");
                     (None, None)
@@ -131,7 +132,7 @@ impl UiaService {
             health: HashMap::new(),
             denylist,
             event_manager,
-            event_receiver,
+            event_signal,
         })
     }
 
@@ -145,15 +146,6 @@ impl UiaService {
             return Outcome::Unavailable("uia levert niets voor deze app");
         }
 
-        // Een event vertelt ons alleen dát er iets veranderd is; het mag
-        // nooit een reden zijn om de leesactie zelf anders uit te voeren.
-        // Vóór deze fix deed de event-tak een eigen synchrone COM-aanroep
-        // (nieuwe UiaReader, geen deadline, niet van de tokio-runtime af)
-        // — precies het gevaar waar de rest van dit bestand tegen
-        // beveiligt. Nu komen beide routes samen in `read_via_worker`.
-        if let Some(reason) = self.matching_event(hwnd) {
-            tracing::trace!(app = app_key, soort = reason, "uia-event ontvangen");
-        }
         // Goedkope controle, elke tik: zit de eventthread vast in een
         // registratie bij een provider zonder deadline? Verandert niets aan
         // de leesactie hieronder — die loopt sowieso altijd via de
@@ -166,17 +158,11 @@ impl UiaService {
         self.read_via_worker(app_key, hwnd).await
     }
 
-    /// Haalt hoogstens één in de wachtrij staand event op dat bij `hwnd`
-    /// hoort. Events voor een ander venster, en een eventuele rest na de
-    /// eerste match, blijven gewoon staan voor een volgende tik — ze zijn
-    /// puur signalerend en sturen niets buiten `read_via_worker` om aan.
-    fn matching_event(&self, hwnd: isize) -> Option<&'static str> {
-        let event_receiver = self.event_receiver.as_ref()?;
-        match event_receiver.try_recv() {
-            Ok(UiaEvent::StructureChanged { hwnd: h, .. }) if h == hwnd => Some("structuur"),
-            Ok(UiaEvent::PropertyChanged { hwnd: h, .. }) if h == hwnd => Some("property"),
-            _ => None,
-        }
+    /// Geeft een ontvanger die bij elke UIA-wijziging wakker wordt. De waarde
+    /// zelf is alleen een versieteller; de pipeline leest daarna via de
+    /// bestaande worker met deadline en behandelt het event nooit als data.
+    pub fn subscribe_events(&self) -> Option<watch::Receiver<u64>> {
+        self.event_signal.as_ref().map(watch::Sender::subscribe)
     }
 
     /// De enige plek waar UIA daadwerkelijk gelezen wordt: altijd via de
@@ -274,7 +260,7 @@ mod tests {
             health: HashMap::new(),
             denylist,
             event_manager: None,
-            event_receiver: None,
+            event_signal: None,
         }
     }
 
