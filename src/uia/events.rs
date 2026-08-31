@@ -21,13 +21,29 @@
 //! marshaling. Andere threads raken ze daarom nooit rechtstreeks aan, alleen
 //! via `PostMessageW` (commando's erin) en het `Sender<UiaEvent>`-kanaal
 //! (events eruit).
+//!
+//! **Eén thread per geregistreerd venster, niet één gedeelde thread.**
+//! `AddStructureChangedEventHandler`/`AddPropertyChangedEventHandlerNativeArray`
+//! zijn synchrone COM-aanroepen zonder deadline. Bij sommige providers (met
+//! name Electron/Chromium-vensters, waar het abonneren op structuurwijziging
+//! de renderer dwingt tot volledige accessibility-mode) kunnen ze minutenlang
+//! of voorgoed blijven hangen. Met één gedeelde thread voor alle vensters zou
+//! zo'n hang de message-pump — en daarmee elk event, voor elk venster —
+//! stilleggen voor de rest van de procesduur. `UiaEventThread::switch_window`
+//! start daarom bij elke voorgrondwissel een gloednieuwe thread voor het
+//! nieuwe venster en laat de oude gewoon los (`request_shutdown` + de
+//! `JoinHandle` nooit joinen): een vastzittende registratie voor app A
+//! blokkeert dan alleen zichzelf, nooit de events van app B die daarna
+//! voorgrond wordt. De prijs is een klein, begrensd lek — een thread die
+//! nooit teruggeeft blijft draaien tot het proces stopt — in ruil voor het
+//! voorkomen van een permanente, procesbrede uitval.
 
 use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, SAFEARRAY,
 };
@@ -274,7 +290,6 @@ impl ThreadState {
 // ---------------------------------------------------------------------------
 
 const WM_UIA_REGISTER: u32 = WM_APP + 1;
-const WM_UIA_UNREGISTER: u32 = WM_APP + 2;
 const WM_UIA_SHUTDOWN: u32 = WM_APP + 3;
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -293,13 +308,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Err(e) = state.register(target) {
                     tracing::debug!(error = %e, "uia event registratie mislukt");
                 }
-            }
-            LRESULT(0)
-        }
-        WM_UIA_UNREGISTER => {
-            if let Some(state) = state_from(hwnd) {
-                let target = HWND(lparam.0 as *mut core::ffi::c_void);
-                state.unregister(target);
             }
             LRESULT(0)
         }
@@ -387,11 +395,16 @@ fn run(event_sender: Sender<UiaEvent>, busy: BusySince, ready: std::sync::mpsc::
             lpszClassName: PCWSTR(class_name.as_ptr()),
             ..Default::default()
         };
-        if unsafe { RegisterClassExW(&class) } == 0 {
+        if unsafe { RegisterClassExW(&class) } == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
             // De boxed state zou anders nooit meer vrijkomen.
             drop(unsafe { Box::from_raw(state_ptr) });
             return Err(anyhow!("uia-events vensterklasse registreren mislukt"));
         }
+        // ERROR_CLASS_ALREADY_EXISTS is hier verwacht en onschuldig: sinds
+        // elke voorgrondwissel een eigen thread start, meldt elke thread ná
+        // de eerste dezelfde klasse (bij hetzelfde `hinstance`) opnieuw aan.
+        // Vensterklassen zijn niet apartment- of thread-gebonden — welke
+        // thread ook registreerde, `CreateWindowExW` hieronder werkt gewoon.
 
         let window_name: Vec<u16> = "ChronicleUiaEventsWindow\0".encode_utf16().collect();
         let hwnd = unsafe {
@@ -453,10 +466,11 @@ const STUCK_THRESHOLD: Duration = Duration::from_secs(5);
 /// loslaat in plaats van het afsluiten van het hele proces te laten hangen.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// Handvat voor de STA-eventthread. `register_window_events` en
-/// `unregister_window_events` posten alleen een bericht — de daadwerkelijke
-/// COM-aanroepen gebeuren op de eventthread zelf, nooit hier.
-pub struct UiaEventThread {
+/// Eén draaiende message-only thread, toegewijd aan precies één venster voor
+/// de rest van zijn leven. `hwnd` is het adres van *deze* thread om naartoe
+/// te posten, niet het doelvenster (dat kreeg zijn registratie al bij het
+/// aanmaken, zie `spawn_window_thread`).
+struct WindowThread {
     hwnd: isize,
     busy: BusySince,
     /// Voorkomt dat een vastgelopen thread bij elke tik opnieuw gelogd wordt.
@@ -464,44 +478,14 @@ pub struct UiaEventThread {
     join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl UiaEventThread {
-    pub fn start(event_sender: Sender<UiaEvent>) -> Result<Self> {
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<isize>>();
-        let busy = BusySince::new();
-        let busy_for_thread = busy.clone();
-
-        let join_handle = std::thread::Builder::new()
-            .name("chronicle-uia-events".into())
-            .spawn(move || run(event_sender, busy_for_thread, ready_tx))
-            .context("uia-events thread starten mislukt")?;
-
-        let hwnd = ready_rx
-            .recv()
-            .map_err(|_| anyhow!("uia-events thread startte niet"))??;
-
-        Ok(Self {
-            hwnd,
-            busy,
-            warned_stuck: std::sync::atomic::AtomicBool::new(false),
-            join_handle: Some(join_handle),
-        })
-    }
-
-    pub fn register_window_events(&self, hwnd: HWND) -> Result<()> {
-        self.post(WM_UIA_REGISTER, hwnd)
-    }
-
-    pub fn unregister_window_events(&self, hwnd: HWND) -> Result<()> {
-        self.post(WM_UIA_UNREGISTER, hwnd)
-    }
-
-    /// Meldt eenmalig — niet bij elke tik opnieuw — of de eventthread al
-    /// langer dan `STUCK_THRESHOLD` in één registratie vastzit. `PostMessageW`
+impl WindowThread {
+    /// Meldt eenmalig — niet bij elke tik opnieuw — of deze thread al langer
+    /// dan `STUCK_THRESHOLD` in zijn registratie vastzit. `PostMessageW`
     /// blijft daarna gewoon werken (die blokkeert nooit op een volle
     /// wachtrij bij dit soort volumes); dit is puur zichtbaarheid voor een
     /// situatie die anders geruisloos verdwijnt in "er komen geen events
     /// meer" zonder dat iets zegt waarom.
-    pub fn warn_if_stuck(&self, app_key: &str) {
+    fn warn_if_stuck(&self, app_key: &str) {
         match self.busy.stuck_for() {
             Some(elapsed) if elapsed >= STUCK_THRESHOLD => {
                 if !self.warned_stuck.swap(true, Ordering::Relaxed) {
@@ -518,21 +502,121 @@ impl UiaEventThread {
         }
     }
 
-    fn post(&self, msg: u32, hwnd: HWND) -> Result<()> {
+    fn request_shutdown(&self) {
         let target = HWND(self.hwnd as *mut core::ffi::c_void);
-        unsafe { PostMessageW(Some(target), msg, WPARAM(0), LPARAM(hwnd.0 as isize)) }
-            .context("bericht naar uia-events thread posten mislukt")
+        unsafe {
+            let _ = PostMessageW(Some(target), WM_UIA_SHUTDOWN, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Start een nieuwe thread die zijn eigen `IUIAutomation` opbouwt en, zodra
+/// zijn message-only venster bestaat, een registratie voor `target` post
+/// (fire-and-forget: deze functie wacht nooit op die registratie zelf, alleen
+/// op het — snelle, deadline-loze-COM-aanroep-vrije — aanmaken van het
+/// venster). `target = None` is de eenmalige proefopstart in `start()`: die
+/// bevestigt dat COM/STA hier werkt, zonder iets te registreren.
+fn spawn_window_thread(event_sender: Sender<UiaEvent>, target: Option<HWND>) -> Result<WindowThread> {
+    let target_val = target.map(|h| h.0 as isize);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<isize>>();
+    let busy = BusySince::new();
+    let busy_for_thread = busy.clone();
+
+    let join_handle = std::thread::Builder::new()
+        .name("chronicle-uia-events".into())
+        .spawn(move || run(event_sender, busy_for_thread, ready_tx))
+        .context("uia-events thread starten mislukt")?;
+
+    let hwnd = ready_rx
+        .recv()
+        .map_err(|_| anyhow!("uia-events thread startte niet"))??;
+
+    if let Some(target_val) = target_val {
+        let msg_window = HWND(hwnd as *mut core::ffi::c_void);
+        unsafe {
+            let _ = PostMessageW(Some(msg_window), WM_UIA_REGISTER, WPARAM(0), LPARAM(target_val));
+        }
+    }
+
+    Ok(WindowThread {
+        hwnd,
+        busy,
+        warned_stuck: std::sync::atomic::AtomicBool::new(false),
+        join_handle: Some(join_handle),
+    })
+}
+
+/// Handvat voor het event-driven UIA-mechanisme. Houdt hoogstens één
+/// `WindowThread` vast — die van het huidige voorgrondvenster — achter een
+/// `Mutex` omdat `switch_window`/`warn_if_stuck` via `&self` aangeroepen
+/// worden. Zie de moduledocumentatie bovenaan voor waarom dit per venster een
+/// eigen thread is in plaats van één gedeelde.
+pub struct UiaEventThread {
+    event_sender: Sender<UiaEvent>,
+    current: std::sync::Mutex<Option<WindowThread>>,
+}
+
+impl UiaEventThread {
+    pub fn start(event_sender: Sender<UiaEvent>) -> Result<Self> {
+        // Eenmalige proefopstart: bevestigt dat COM/STA en de vensterklasse
+        // op dit systeem werken. Lukt dit niet, dan valt de aanroeper terug
+        // op alleen polling — precies zoals vóór deze aanpak, alleen faalt
+        // dat nu één keer bij start in plaats van stilzwijgend bij elke
+        // voorgrondwissel opnieuw. Lukt het wel, dan gooien we deze
+        // wegwerp-thread meteen weg; pas de eerste `switch_window` start de
+        // thread die er echt toe doet.
+        let probe = spawn_window_thread(event_sender.clone(), None)?;
+        probe.request_shutdown();
+
+        Ok(Self {
+            event_sender,
+            current: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Registreert events voor `hwnd` op een gloednieuwe thread en laat de
+    /// vorige los. Blokkeert nooit op de registratie zelf (die gebeurt async
+    /// op de nieuwe thread) en nooit op een eventueel vastzittende oude
+    /// thread — die krijgt een shutdown-bericht en wordt dan losgelaten
+    /// zonder erop te wachten (`join_handle` wordt nooit gejoind), zodat een
+    /// hangende registratie voor het vorige venster nooit de events van dit
+    /// venster tegenhoudt.
+    pub fn switch_window(&self, hwnd: HWND) -> Result<()> {
+        let new = spawn_window_thread(self.event_sender.clone(), Some(hwnd))?;
+        let old = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(new);
+        if let Some(old) = old {
+            old.request_shutdown();
+        }
+        Ok(())
+    }
+
+    /// Meldt of de thread van het huidige venster vastzit in zijn
+    /// registratie. Zie `WindowThread::warn_if_stuck`.
+    pub fn warn_if_stuck(&self, app_key: &str) {
+        let guard = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(wt) = guard.as_ref() {
+            wt.warn_if_stuck(app_key);
+        }
     }
 }
 
 impl Drop for UiaEventThread {
     fn drop(&mut self) {
-        let target = HWND(self.hwnd as *mut core::ffi::c_void);
-        unsafe {
-            let _ = PostMessageW(Some(target), WM_UIA_SHUTDOWN, WPARAM(0), LPARAM(0));
-        }
+        let Some(mut current) = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return;
+        };
+        current.request_shutdown();
 
-        let Some(handle) = self.join_handle.take() else {
+        let Some(handle) = current.join_handle.take() else {
             return;
         };
         // Zat de thread al vast in een providerloze COM-aanroep, dan ligt het

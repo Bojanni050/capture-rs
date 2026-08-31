@@ -282,20 +282,18 @@ impl Pipeline {
             return Ok(());
         }
 
-        // Als event-driven UIA ingeschakeld is, registreer dan event handlers
-        // voor het voorgrondvenster (stub: alleen bookkeeping, geen echte hook).
-        // Alleen bij vensterwissel, anders groeit de handler-map onbegrensd.
+        // Als event-driven UIA ingeschakeld is, wissel de event-registratie
+        // naar het nieuwe voorgrondvenster. `switch_window` start daarvoor
+        // een eigen thread en laat de vorige los, zodat een vastzittende
+        // registratie voor het oude venster nooit de events van dit venster
+        // blokkeert (zie de moduledocumentatie in `uia/events.rs`).
         if let Some(ref uia_service) = self.uia
             && uia_service.cfg.event_driven
             && let Some(ref manager) = uia_service.event_manager
             && self.last_hwnd != Some(window.hwnd)
         {
-            if let Some(old) = self.last_hwnd {
-                let old_hwnd = HWND(old as *mut core::ffi::c_void);
-                let _ = manager.unregister_window_events(old_hwnd);
-            }
             let hwnd_obj = HWND(window.hwnd as *mut core::ffi::c_void);
-            if let Err(e) = manager.register_window_events(hwnd_obj) {
+            if let Err(e) = manager.switch_window(hwnd_obj) {
                 tracing::debug!(app = app_key, error = %e, "UIA event registratie mislukt");
             }
             self.last_hwnd = Some(window.hwnd);
