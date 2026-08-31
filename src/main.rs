@@ -210,7 +210,7 @@ async fn cmd_start(cfg: Config, no_server: bool) -> Result<()> {
         None
     };
     let embeddings_provider = if cfg.embeddings.enabled {
-        Some(embeddings::make_provider(&cfg))
+        Some(embeddings::make_provider(&cfg).await)
     } else {
         None
     };
@@ -280,7 +280,7 @@ async fn cmd_serve(cfg: Config) -> Result<()> {
         None
     };
     let embeddings_provider = if cfg.embeddings.enabled {
-        Some(embeddings::make_provider(&cfg))
+        Some(embeddings::make_provider(&cfg).await)
     } else {
         None
     };
@@ -668,7 +668,7 @@ async fn cmd_search_semantic(
         return Ok(());
     }
     let store = embeddings::make_store(&cfg);
-    let provider = embeddings::make_provider(&cfg);
+    let provider = embeddings::make_provider(&cfg).await;
 
     // Check beschikbaarheid
     if let Err(e) = store.ensure_schema().await {
@@ -678,16 +678,17 @@ async fn cmd_search_semantic(
     }
 
     let from = Local::now().timestamp() - parse_duration(since)?;
-    // Embed query
+    // Embed query — via embed_query, niet embed: asymmetrische modellen als
+    // E5 leren een apart voorvoegsel voor zoekvragen versus opgeslagen tekst.
     let q_emb = tokio::task::spawn_blocking({
         let provider = provider.clone();
         let q = query.clone();
-        move || provider.embed(&[q])
+        move || provider.embed_query(&q)
     })
     .await
     .map_err(|e| anyhow!("embed task panicked: {e}"))??;
 
-    let hits = store.search(q_emb[0].clone(), limit.max(1) as usize).await?;
+    let hits = store.search(q_emb, limit.max(1) as usize).await?;
     if hits.is_empty() {
         println!("Niets gevonden (semantisch).");
         return Ok(());
@@ -721,8 +722,7 @@ async fn cmd_search_semantic(
 
 async fn cmd_embeddings_status(cfg: Config) -> Result<()> {
     println!("Embeddings enabled: {}", cfg.embeddings.enabled);
-    println!("Provider: {} ({})", cfg.embeddings.provider, cfg.embeddings.model);
-    println!("Dimensions: {}", cfg.embeddings.dimensions);
+    println!("Provider (config): {}", cfg.embeddings.provider);
     println!(
         "Postgres: {}",
         cfg.embeddings_postgres_url().unwrap_or_else(|| "(geen)".into())
@@ -731,6 +731,16 @@ async fn cmd_embeddings_status(cfg: Config) -> Result<()> {
         println!("(uitgeschakeld — geen indexering)");
         return Ok(());
     }
+
+    // Bouw de provider écht op — dit is de enige manier om te weten of een
+    // fastembed-model daadwerkelijk laadt (of downloadt, eerste keer) in
+    // plaats van alleen te herhalen wat er in de config staat. Mislukt het
+    // laden, dan valt `make_provider` terug op de mock en staat de reden al
+    // in de logs (WARN, dus zichtbaar zonder -v).
+    let provider = embeddings::make_provider(&cfg).await;
+    println!("Model (geladen): {}", provider.model_name());
+    println!("Dimensions (geladen): {}", provider.dimensions());
+
     let store = embeddings::make_store(&cfg);
     match store.ensure_schema().await {
         Ok(_) => println!("Vector store: beschikbaar"),
@@ -754,7 +764,7 @@ async fn cmd_embeddings_rebuild(cfg: Config, since: &str, limit: i64) -> Result<
     }
     let (db, _) = open_store(&cfg)?;
     let store = embeddings::make_store(&cfg);
-    let provider = embeddings::make_provider(&cfg);
+    let provider = embeddings::make_provider(&cfg).await;
     store.ensure_schema().await?;
 
     let from = chrono::Utc::now().timestamp() - parse_duration(since)?;

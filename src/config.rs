@@ -226,7 +226,9 @@ impl Default for StorageConfig {
 pub struct EmbeddingsConfig {
     /// Semantische index aan/uit. Uit = capture werkt normaal, alleen vector zoek is unavailable.
     pub enabled: bool,
-    /// Provider: "mock" (tests) of "fastembed" (lokaal ONNX). Voor v1 alleen mock actief.
+    /// Provider: "mock" (deterministisch, geen echt model — voor tests en als
+    /// veilige default) of "fastembed" (intfloat/multilingual-e5-small,
+    /// lokaal via ONNX Runtime; downloadt ~118 MB bij een lege cache).
     pub provider: String,
     /// Model naam voor provenance (bv. intfloat/multilingual-e5-small).
     pub model: String,
@@ -394,6 +396,16 @@ impl Config {
 
     pub fn frames_dir(&self) -> Result<PathBuf> {
         let dir = self.resolved_data_dir()?.join("frames");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// Waar lokale embeddingmodellen gecached worden. `fastembed`'s eigen
+    /// default is een relatief pad (`.fastembed_cache`), dus afhankelijk van
+    /// de werkmap zou hetzelfde model telkens opnieuw gedownload kunnen
+    /// worden. Dit legt het naast de rest van Chronicle's data vast.
+    pub fn models_dir(&self) -> Result<PathBuf> {
+        let dir = self.resolved_data_dir()?.join("models");
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }

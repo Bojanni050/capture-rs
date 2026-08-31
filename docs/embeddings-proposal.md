@@ -1,11 +1,14 @@
 # Chronicle Embeddings — Architecture Proposal
 
 ## Status
-Geïmplementeerd als scaffolding, **niet productie-klaar**. `embeddings.enabled`
-staat standaard op `false`. Zie [§9 Bekende beperkingen](#9-bekende-beperkingen)
-voordat je het aanzet — met name: er zit nog geen echt embeddingmodel achter,
-dus semantisch zoeken vindt op dit moment alleen letterlijke herhalingen, geen
-verwante tekst in andere bewoordingen.
+Geïmplementeerd, **niet productie-klaar**. `embeddings.enabled` staat
+standaard op `false`; zelfs aangezet blijft `provider = "mock"` de default,
+dus een `enabled = true` alleen triggert nooit onverwacht een modeldownload.
+Zet daarnaast `provider = "fastembed"` voor een echt lokaal model
+(`intfloat/multilingual-e5-small`, via `FastEmbedProvider` in
+`embeddings/provider.rs`, ~118 MB eenmalige download, ONNX Runtime CPU). Zie
+[§9 Bekende beperkingen](#9-bekende-beperkingen) voor wat nog ontbreekt
+rondom de omliggende infrastructuur (gedeelde state, connection pooling).
 
 ## 1. Inspectie
 
@@ -117,16 +120,22 @@ plaats van de gefilterde tekst uit `captures_fts`, en de indexer-cursor
 overleefde geen herstart). De rest staat hier gedocumenteerd, bewust niet
 opgelost:
 
-- **Geen echt embeddingmodel.** `make_provider` in `embeddings/mod.rs`
-  construeert altijd een `MockProvider` — §7 stap 1 noemt `FastEmbedProvider`
-  als optionele feature, maar die is nooit gebouwd. `MockProvider::mock_embed`
-  hasht de volledige inputtekst per dimensie; twee verschillende formuleringen
-  van hetzelfde idee leveren vectoren op die net zo oncorreleerd zijn als
-  willekeurige tekst. Bruikbaar voor deterministische tests, niet voor
-  semantisch zoeken. Zie de vraag "which local model" in de sessie-historie
-  voor een concrete aanbeveling (`intfloat/multilingual-e5-small` via
-  `fastembed`, 384 dims — sluit aan op de dimensies die nu al overal
-  hardcoded staan).
+- ~~Geen echt embeddingmodel~~ — **opgelost.** `FastEmbedProvider`
+  (`embeddings/provider.rs`) gebruikt `intfloat/multilingual-e5-small` via
+  `fastembed`/ONNX Runtime, met de query/passage-voorvoegsels die dit
+  specifieke model verwacht (`embed_query` vs `embed` op de
+  `EmbeddingProvider`-trait). `make_provider` is nu `async` en laadt het
+  model via `spawn_blocking` (de download bij een lege cache mag nooit de
+  tokio-runtime blokkeren); mislukt dat laden — geen internet bij de eerste
+  run, ONNX-probleem — dan valt het terug op `MockProvider` met een
+  zichtbare `WARN`, niet stil. Cache leeft in `<datamap>/models`, niet in
+  `fastembed`'s eigen werkmap-relatieve default. Bewezen met een live test
+  (`fastembed_herkent_verwante_tekst_niet_alleen_letterlijke_match`,
+  `#[ignore]`d — downloadt echt het model): twee formuleringen van hetzelfde
+  idee scoren aantoonbaar hoger dan een ongerelateerd paar, in tegenstelling
+  tot de mock. `MockProvider` blijft de default (`provider = "mock"`) zodat
+  `enabled = true` nooit ongevraagd een download triggert — `fastembed` moet
+  je expliciet aanzetten.
 - **`InMemoryStore` is niet gedeeld tussen processen.** Zonder `postgres_url`
   bouwt elke processtart zijn eigen lege `Vec` op. `cmd_start` deelt één
   instantie tussen zijn eigen indexer en webserver (vandaar dat de HTTP-API

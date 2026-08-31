@@ -232,12 +232,18 @@ src/
 
 Naast FTS5 zit er een `[embeddings]`-sectie in de config (`enabled = false`
 standaard) die captures groepeert, embedt en in pgvector opslaat voor
-`chronicle search --semantic`. Dit is nog scaffolding, geen afgeronde
-feature: er zit op dit moment geen echt embeddingmodel achter — alleen een
-deterministische mock die exacte herhalingen herkent, geen verwante tekst in
-andere bewoordingen — en zonder een draaiende Postgres/pgvector deelt geen
-enkele losse CLI-aanroep zijn data met een lopend `chronicle start`-proces.
-Zie [`docs/embeddings-proposal.md`](docs/embeddings-proposal.md) voor de
+`chronicle search --semantic`. Met `provider = "fastembed"` gebruikt dat een
+echt lokaal model (`intfloat/multilingual-e5-small`, ONNX Runtime, CPU,
+NL+EN) — geen cloud-aanroep, wel een eenmalige download van ~118 MB bij een
+lege modelcache. De default blijft `provider = "mock"`, dus `enabled = true`
+alleen triggert nooit ongevraagd die download.
+
+Dit is nog geen afgeronde feature: zonder een draaiende Postgres/pgvector
+deelt geen enkele losse CLI-aanroep (`chronicle search --semantic`,
+`chronicle embeddings status/rebuild`) zijn data met een lopend
+`chronicle start`-proces — alleen de ingebouwde webinterface van dat proces
+zelf ziet wat er geïndexeerd is. Zie
+[`docs/embeddings-proposal.md`](docs/embeddings-proposal.md) voor de
 volledige architectuur en een expliciete lijst bekende beperkingen voordat je
 het aanzet.
 
