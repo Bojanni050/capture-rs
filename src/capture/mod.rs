@@ -6,4 +6,6 @@ pub mod window;
 pub use events::ForegroundEvents;
 pub use idle::idle_seconds;
 pub use screen::ScreenCapturer;
-pub use window::{foreground, top_level_windows, WindowInfo};
+pub use window::{
+    foreground, foreground_hwnd, top_level_windows, window_rect, Rect, WindowInfo,
+};

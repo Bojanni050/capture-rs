@@ -3,10 +3,15 @@
 //! Per tik doorloopt een frame een reeks beslissingen, van goedkoop naar duur:
 //!
 //! ```text
-//!   venster + idle ──poort──▶ screenshot ──beeldhash──▶ UIA ──▶ OCR ──▶ opslag
-//!         │                        │                     │       │        │
-//!     overslaan               onveranderd            te weinig  te     tekst of
-//!                             → segment rekken        tekst   rommelig  beeld
+//!   venster + idle ──poort──▶ screenshot ──bijsnijden──▶ beeldhash ──▶ UIA ──▶ OCR ──▶ opslag
+//!         │                        │            │              │        │       │        │
+//!     overslaan                    │       venster niet    onveranderd te weinig  te    tekst of
+//!                                  │       op dit scherm   → segment    tekst   rommelig  beeld
+//!                                  │       → shot overslaan  rekken
+//!                                  │
+//!                             beperkt tot het rechthoek van het voorgrondvenster: content
+//!                             van andere, overlappende vensters komt zo nooit in OCR of
+//!                             een bewaard beeld terecht.
 //! ```
 //!
 //! Drie tekstbronnen, in volgorde van betrouwbaarheid:
@@ -19,7 +24,10 @@
 //!    ontwerptool), dan bewaren we het frame zelf, zodat er nooit een gat in
 //!    je tijdlijn valt.
 
-use crate::capture::{ForegroundEvents, ScreenCapturer, WindowInfo, foreground, idle_seconds};
+use crate::capture::{
+    ForegroundEvents, Rect, ScreenCapturer, WindowInfo, foreground, foreground_hwnd, idle_seconds,
+    window_rect,
+};
 use crate::config::{Config, FramePolicy};
 use crate::filter::{dedupe, Gate, NoiseFilter};
 use crate::ocr::OcrService;
@@ -249,9 +257,30 @@ impl Pipeline {
         // noch UIA noch OCR. Bij meerdere schermen gebruiken we OCR per
         // scherm; UIA hoort bij één voorgrondvenster en is geen bron voor de
         // inhoud van een tweede monitor.
+        //
+        // De vensterrechthoek vragen we op vlak vóór de screenshot, niet
+        // erna: hoe dichter dit bij elkaar zit, hoe kleiner de kans dat het
+        // venster ondertussen sluit of verplaatst en rechthoek en pixels niet
+        // meer bij elkaar horen.
+        let win_rect = window_rect(window.hwnd);
+
         tracing::trace!("screenshot maken");
         let shots = block_in_place(|| self.capturer.capture())?;
         tracing::trace!(frames = shots.len(), "screenshot klaar");
+
+        // Was het voorgrondvenster nog hetzelfde toen de screenshot echt
+        // genomen werd? Zo niet — het venster sloot of wisselde middenin —
+        // dan horen de rechthoek hierboven en de zojuist gemaakte pixels niet
+        // meer bij elkaar. Beter deze tik overslaan (de volgende komt er
+        // binnen een paar seconden aan) dan content aan de verkeerde app
+        // toeschrijven door een verouderde rechthoek te gebruiken.
+        if foreground_hwnd() != window.hwnd {
+            tracing::debug!(
+                app = app_key,
+                "voorgrondvenster wisselde tijdens screenshot, tik overgeslagen"
+            );
+            return Ok(());
+        }
 
         // Als event-driven UIA ingeschakeld is, registreer dan event handlers
         // voor het voorgrondvenster (stub: alleen bookkeeping, geen echte hook).
@@ -272,7 +301,26 @@ impl Pipeline {
             self.last_hwnd = Some(window.hwnd);
         }
 
+        // Elke shot bijsnijden tot het zichtbare rechthoek van het
+        // voorgrondvenster (opgehaald vlak vóór de screenshot hierboven):
+        // content van andere, overlappende vensters mag nooit in OCR, de
+        // beeldhash of een bewaard beeld terechtkomen. Kunnen we de grenzen
+        // niet bepalen (DWM weigert), dan gebruiken we liever de hele shot
+        // dan de capture over te slaan.
         for shot in shots {
+            let image = match win_rect {
+                Some(rect) => match crop_to_window(&shot.image, shot.x, shot.y, rect) {
+                    Some(cropped) => cropped,
+                    None => {
+                        // Het voorgrondvenster raakt dit scherm niet — hier
+                        // is niets van te zien, dus geen zin in OCR erop.
+                        tracing::trace!(monitor = %shot.monitor, "venster niet op dit scherm");
+                        continue;
+                    }
+                },
+                None => shot.image,
+            };
+
             self.process_frame(
                 FrameContext {
                     segment_id,
@@ -282,7 +330,7 @@ impl Pipeline {
                     ts,
                     now: &now,
                 },
-                shot.image,
+                image,
             )
             .await?;
         }
@@ -536,6 +584,34 @@ impl Pipeline {
     }
 }
 
+/// Snijdt een shot bij tot het snijvlak met `rect`, een vensterrechthoek in
+/// virtuele-schermcoördinaten. `shot_x`/`shot_y` zijn de oorsprong van déze
+/// monitor in diezelfde ruimte — `rect` staat immers los van welke monitor
+/// het venster toevallig raakt. Geeft `None` als het venster dit scherm
+/// helemaal niet raakt: er valt dan niets zinnigs te lezen op deze monitor,
+/// en zonder deze check zou een tweede scherm dat toevallig iets anders
+/// toont volledig meegelezen worden en aan de verkeerde app toegeschreven.
+fn crop_to_window(image: &RgbaImage, shot_x: i32, shot_y: i32, rect: Rect) -> Option<RgbaImage> {
+    let (mw, mh) = (image.width() as i32, image.height() as i32);
+    let left = (rect.left - shot_x).max(0);
+    let top = (rect.top - shot_y).max(0);
+    let right = (rect.right - shot_x).min(mw);
+    let bottom = (rect.bottom - shot_y).min(mh);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(
+        image::imageops::crop_imm(
+            image,
+            left as u32,
+            top as u32,
+            (right - left) as u32,
+            (bottom - top) as u32,
+        )
+        .to_image(),
+    )
+}
+
 /// Past het retentiebeleid toe. Geeft terug hoeveel items zijn opgeruimd.
 pub fn run_retention(cfg: &Config, db: &Db, frames: &FrameStore) -> Result<i64> {
     let now = Local::now().timestamp();
@@ -564,4 +640,66 @@ pub fn run_retention(cfg: &Config, db: &Db, frames: &FrameStore) -> Result<i64> 
     }
 
     Ok(report.captures_deleted + report.frames_deleted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::Rgba;
+
+    fn image(w: u32, h: u32) -> RgbaImage {
+        RgbaImage::from_pixel(w, h, Rgba([1, 2, 3, 255]))
+    }
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
+        Rect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn venster_volledig_binnen_het_scherm_snijdt_exact() {
+        let img = image(1920, 1080);
+        // Monitor begint op (100, 50) in virtuele coördinaten; venster staat
+        // op (200, 150)-(800, 600) in diezelfde ruimte.
+        let cropped = crop_to_window(&img, 100, 50, rect(200, 150, 800, 600)).unwrap();
+        assert_eq!(cropped.dimensions(), (600, 450));
+    }
+
+    #[test]
+    fn venster_op_een_andere_monitor_levert_niets_op() {
+        let img = image(1920, 1080);
+        // Deze shot beslaat virtueel (0,0)-(1920,1080); het venster zit
+        // volledig op een tweede scherm ernaast.
+        let result = crop_to_window(&img, 0, 0, rect(2000, 100, 2400, 500));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn venster_hangt_deels_over_de_schermrand_wordt_afgeknipt() {
+        let img = image(1000, 800);
+        // Venster begint 100px vóór deze monitor en loopt 200px voorbij de
+        // rechterrand — alleen het overlappende deel hoort in het resultaat.
+        let cropped = crop_to_window(&img, 0, 0, rect(-100, 0, 1200, 800)).unwrap();
+        assert_eq!(cropped.dimensions(), (1000, 800));
+    }
+
+    #[test]
+    fn venster_groter_dan_het_scherm_wordt_beperkt_tot_het_scherm() {
+        let img = image(500, 400);
+        let cropped = crop_to_window(&img, 0, 0, rect(-1000, -1000, 5000, 5000)).unwrap();
+        assert_eq!(cropped.dimensions(), (500, 400));
+    }
+
+    #[test]
+    fn venster_precies_op_de_rand_levert_niets_op() {
+        let img = image(500, 400);
+        // Rechterrand van het venster valt samen met de linkerrand van dit
+        // scherm: nul breedte, geen overlap om iets uit te lezen.
+        let result = crop_to_window(&img, 0, 0, rect(-100, 0, 0, 400));
+        assert!(result.is_none());
+    }
 }

@@ -24,6 +24,11 @@ enum MonitorSelector {
 pub struct Shot {
     pub image: RgbaImage,
     pub monitor: String,
+    /// Oorsprong van deze monitor in virtuele-schermcoördinaten — nodig om
+    /// een vensterrechthoek (die in diezelfde ruimte staat) te vertalen naar
+    /// pixelcoördinaten binnen dít beeld.
+    pub x: i32,
+    pub y: i32,
 }
 
 impl ScreenCapturer {
@@ -114,6 +119,8 @@ impl ScreenCapturer {
                 Ok(image) => out.push(Shot {
                     image,
                     monitor: name,
+                    x: m.x().unwrap_or(0),
+                    y: m.y().unwrap_or(0),
                 }),
                 Err(e) => tracing::warn!(monitor = %name, error = %e, "screenshot mislukt"),
             }

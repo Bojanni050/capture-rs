@@ -3,13 +3,15 @@
 //! Dit is de goedkoopste context die we hebben: het kost microseconden en
 //! bepaalt of we überhaupt een screenshot hoeven te maken.
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT};
 use windows::core::BOOL;
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindowVisible,
 };
 use windows::core::PWSTR;
 
@@ -35,6 +37,71 @@ impl WindowInfo {
             .unwrap_or(&self.exe)
             .to_string()
     }
+}
+
+/// Het zichtbare rechthoek van een venster, in fysieke virtuele-scherm-
+/// pixels — dezelfde ruimte waarin schermafbeeldingen leven. Gebruikt om
+/// screenshots te beperken tot dit venster, zodat content van andere,
+/// overlappende vensters nooit meegenomen wordt in OCR of een bewaard beeld.
+///
+/// Vereist dat het proces per-monitor DPI-bewust is (zie `main.rs`); zonder
+/// dat geeft Windows gevirtualiseerde coördinaten terug die niet meer
+/// overeenkomen met de fysieke pixels van een screenshot.
+#[derive(Debug, Clone, Copy)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl From<RECT> for Rect {
+    fn from(r: RECT) -> Self {
+        Self {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        }
+    }
+}
+
+/// Vraagt het zichtbare rechthoek van een venster op, of `None` als dat om
+/// welke reden dan ook niet lukt (venster net gesloten, DWM weigert). De
+/// aanroeper valt dan terug op de ongesneden screenshot in plaats van de
+/// capture over te slaan.
+pub fn window_rect(hwnd: isize) -> Option<Rect> {
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    if hwnd.is_invalid() {
+        return None;
+    }
+
+    // DWMWA_EXTENDED_FRAME_BOUNDS geeft de échte zichtbare rand; GetWindowRect
+    // telt op de meeste vensters een paar pixels onzichtbare resize-marge mee,
+    // waardoor het bijgesneden beeld net iets van de buren zou tonen.
+    let mut rect = RECT::default();
+    let via_dwm = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut core::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+    };
+    if via_dwm.is_ok() {
+        return Some(rect.into());
+    }
+
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
+    Some(rect.into())
+}
+
+/// Alleen het handvat van het huidige voorgrondvenster, zonder titel/pid op
+/// te halen. Bedoeld als goedkope re-check: is het venster tussen twee
+/// momenten (bijvoorbeeld vóór en ná een screenshot) hetzelfde gebleven?
+pub fn foreground_hwnd() -> isize {
+    unsafe { GetForegroundWindow().0 as isize }
 }
 
 /// Het actieve venster, of `None` als er geen bruikbare voorgrond is

@@ -119,6 +119,34 @@ ná het ruisfilter nog genoeg inhoud over is.
 Zo valt er nooit een gat in je tijdlijn: je hebt óf de tekst, óf het beeld. Je
 ziet de reden terug in de webinterface bij elk beeld-item.
 
+## Alleen het voorgrondvenster, nooit wat eromheen staat
+
+Een screenshot van het hele scherm laat ook zien wat er ván een niet-
+gemaximaliseerd venster nog zichtbaar is — een ander tabblad, een chatvenster
+op de achtergrond, een sidebar. Zonder maatregel zou dat allemaal door OCR
+gehaald en aan de verkeerde app toegeschreven worden.
+
+Daarom snijdt Chronicle elke screenshot vóór OCR (en vóór een eventueel bewaard
+beeld) bij tot het zichtbare rechthoek van het voorgrondvenster
+(`DwmGetWindowAttribute`/`DWMWA_EXTENDED_FRAME_BOUNDS`, met `GetWindowRect` als
+terugval). Dat rechthoek wordt vlak vóór de screenshot opgevraagd, en er komt
+een re-check ná de screenshot: wisselde het voorgrondvenster ondertussen, dan
+wordt die tik overgeslagen in plaats van een verouderde rechthoek op de
+verkeerde pixels toe te passen. Bij meerdere schermen (`monitor = "all"`)
+betekent dit ook dat een scherm waar het venster niet op staat helemaal niet
+meer meegelezen wordt.
+
+**UI Automation heeft dit probleem structureel niet** — het leest de
+accessibility-boom die geworteld is in één specifiek venster, dus content van
+een ander venster kan daar nooit in lekken. De bijsnijding is dus vooral van
+belang voor de OCR-fallback, en voor de beeld-fallback wanneer die wordt
+opgeslagen.
+
+Dit vereist dat Chronicle per-monitor DPI-bewust is (`main.rs` zet dit bij het
+opstarten) — zonder dat geeft Windows geschaalde coördinaten terug die niet
+meer overeenkomen met de fysieke pixels van een screenshot, en zou het
+bijsnijden het verkeerde stuk scherm pakken.
+
 ## Installatie
 
 Nodig: Rust (stable, msvc-toolchain), Windows 10/11, en minstens één taalpakket

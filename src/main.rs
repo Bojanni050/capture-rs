@@ -135,6 +135,17 @@ enum EmbeddingsCommand {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // Moet vóór alle andere Win32-aanroepen: zonder dit geeft Windows
+    // gevirtualiseerde venstercoördinaten terug op schermen met schaling
+    // ≠100%, die niet meer overeenkomen met de fysieke pixels van een
+    // screenshot — precies wat het bijsnijden op vensterranden (pipeline.rs)
+    // nodig heeft om kloppend te zijn.
+    let _ = unsafe {
+        windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+    };
+
     let cli = Cli::parse();
     init_logging(cli.verbose);
 
