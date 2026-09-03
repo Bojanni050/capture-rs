@@ -3,6 +3,7 @@
 //! Zie `README.md` voor de opzet; de opnamelus zelf staat in `pipeline.rs` en
 //! het filter in `filter/mod.rs`.
 
+mod autostart;
 mod capture;
 mod com;
 mod config;
@@ -13,6 +14,7 @@ mod ocr;
 mod pipeline;
 mod server;
 mod store;
+mod tray;
 mod uia;
 
 use anyhow::{anyhow, Context, Result};
@@ -51,6 +53,9 @@ enum Command {
         /// Draai alleen de opname, zonder webserver.
         #[arg(long)]
         no_server: bool,
+        /// Toon een systemtray-icoon (groen/geel/rood naar gelang de status).
+        #[arg(long)]
+        tray: bool,
     },
     /// Alleen de webinterface, zonder op te nemen.
     Serve,
@@ -109,6 +114,21 @@ enum Command {
         #[command(subcommand)]
         action: EmbeddingsCommand,
     },
+    /// Automatisch opstarten bij het inloggen (met systemtray-icoon).
+    Autostart {
+        #[command(subcommand)]
+        action: AutostartCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AutostartCommand {
+    /// Zet automatisch opstarten aan.
+    Enable,
+    /// Zet automatisch opstarten uit.
+    Disable,
+    /// Toon of het aan of uit staat.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -153,7 +173,7 @@ async fn main() -> Result<()> {
     let (cfg, cfg_path) = Config::load(cli.config.as_deref())?;
 
     match cli.command {
-        Command::Start { no_server } => cmd_start(cfg, no_server).await,
+        Command::Start { no_server, tray } => cmd_start(cfg, no_server, tray).await,
         Command::Serve => cmd_serve(cfg).await,
         Command::Search {
             query,
@@ -184,6 +204,7 @@ async fn main() -> Result<()> {
             EmbeddingsCommand::Rebuild { since, limit } => cmd_embeddings_rebuild(cfg, &since, limit).await,
             EmbeddingsCommand::Purge { older_than, yes } => cmd_embeddings_purge(cfg, older_than, yes).await,
         },
+        Command::Autostart { action } => cmd_autostart(action),
     }
 }
 
@@ -212,7 +233,7 @@ fn open_store(cfg: &Config) -> Result<(Arc<Db>, Arc<FrameStore>)> {
     Ok((db, frames))
 }
 
-async fn cmd_start(cfg: Config, no_server: bool) -> Result<()> {
+async fn cmd_start(cfg: Config, no_server: bool, tray: bool) -> Result<()> {
     // Moet vóór `open_store` gebeuren: twee `start`-instanties die allebei
     // hun eigen migratie/WAL-initialisatie op dezelfde database doen, is
     // precies wat de database eerder corrumpeerde (zie `lock.rs`).
@@ -268,15 +289,22 @@ async fn cmd_start(cfg: Config, no_server: bool) -> Result<()> {
         None
     };
 
+    let dashboard_url = format!("http://{}:{}", cfg.server.bind, cfg.server.port);
     let mut pipeline = pipeline::Pipeline::new(cfg, Arc::clone(&db), Arc::clone(&frames))?;
     tracing::info!(schermen = %pipeline.monitors(), "opname gestart — Ctrl+C om te stoppen");
 
     let (tx, rx) = tokio::sync::watch::channel(false);
+    let ctrlc_tx = tx.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = tx.send(true);
+            let _ = ctrlc_tx.send(true);
         }
     });
+
+    if tray {
+        let status = tray::spawn(dashboard_url, tx);
+        pipeline.attach_tray(status);
+    }
 
     let res = pipeline.run(rx).await;
 
@@ -665,6 +693,24 @@ fn cmd_config(cfg: Config, path: &std::path::Path, init: bool) -> Result<()> {
         println!("# (bestaat nog niet — dit zijn de defaults; `chronicle config --init` schrijft ze weg)");
     }
     println!("{}", toml::to_string_pretty(&cfg)?);
+    Ok(())
+}
+
+fn cmd_autostart(action: AutostartCommand) -> Result<()> {
+    match action {
+        AutostartCommand::Enable => {
+            autostart::enable()?;
+            println!("Chronicle start voortaan automatisch op bij het inloggen (met systemtray-icoon).");
+        }
+        AutostartCommand::Disable => {
+            autostart::disable()?;
+            println!("Automatisch opstarten uitgeschakeld.");
+        }
+        AutostartCommand::Status => {
+            let status = if autostart::is_enabled() { "aan" } else { "uit" };
+            println!("Automatisch opstarten staat {status}.");
+        }
+    }
     Ok(())
 }
 

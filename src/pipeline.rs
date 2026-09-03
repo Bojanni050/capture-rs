@@ -33,6 +33,7 @@ use crate::config::{Config, FramePolicy};
 use crate::filter::{dedupe, Gate, NoiseFilter};
 use crate::ocr::OcrService;
 use crate::store::{Db, FrameStore, NewCapture};
+use crate::tray::{Status as TrayState, TrayStatus};
 use crate::uia::{self, UiaService};
 use anyhow::{Context, Result};
 use chrono::Local;
@@ -105,6 +106,7 @@ pub struct Pipeline {
     app_ids: HashMap<String, i64>,
     ticks: u64,
     last_hwnd: Option<isize>,
+    tray: Option<TrayStatus>,
 }
 
 impl Pipeline {
@@ -160,11 +162,18 @@ impl Pipeline {
             app_ids: HashMap::new(),
             ticks: 0,
             last_hwnd: None,
+            tray: None,
         })
     }
 
     pub fn monitors(&self) -> String {
         self.capturer.describe()
+    }
+
+    /// Koppelt een systemtray-icoon: elke tik werkt daarna de kleur bij
+    /// (groen = actief, geel = idle, rood = de tik mislukte).
+    pub fn attach_tray(&mut self, tray: TrayStatus) {
+        self.tray = Some(tray);
     }
 
     /// Draait tot `shutdown` afgaat.
@@ -198,6 +207,11 @@ impl Pipeline {
 
             if let Err(e) = self.tick(idle).await {
                 tracing::warn!(error = %e, "tik overgeslagen");
+                if let Some(tray) = &self.tray {
+                    tray.set(TrayState::Error);
+                }
+            } else if let Some(tray) = &self.tray {
+                tray.set(if sleeping { TrayState::Idle } else { TrayState::Recording });
             }
 
             let interval = if sleeping {

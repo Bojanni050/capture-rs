@@ -163,6 +163,7 @@ De binary staat in `target/release/chronicle.exe`.
 ```bash
 chronicle doctor              # controleer uia per app, OCR, schermen, database
 chronicle start               # opnemen + webinterface op 127.0.0.1:7331
+chronicle start --tray        # hetzelfde, plus een systemtray-icoon
 chronicle start --no-server   # alleen opnemen
 chronicle serve               # alleen de webinterface
 
@@ -171,7 +172,38 @@ chronicle search "" --since 2h --kind image   # wat is er beeld geworden?
 chronicle stats --since 7d
 chronicle purge --older-than 60d --yes
 chronicle config --init       # schrijf alle instellingen naar een bestand
+
+chronicle autostart enable    # start automatisch op bij het inloggen (met tray-icoon)
+chronicle autostart disable
+chronicle autostart status
 ```
+
+## Systemtray-icoon en automatisch opstarten
+
+`chronicle start --tray` toont een stip in de systemtray die de status van de
+opname laat zien:
+
+| Kleur | Betekent |
+|---|---|
+| 🟢 groen | opname actief |
+| 🟡 geel | je bent even weg (idle) |
+| 🔴 rood | de laatste tik mislukte |
+
+Rechtsklik erop voor het dashboard, een vinkje voor automatisch opstarten en
+"Chronicle afsluiten". Dubbelklikken opent meteen het dashboard.
+
+Voor automatisch opstarten bij het inloggen, zonder het icoon zelf elke keer
+aan te hoeven zetten:
+
+```bash
+chronicle autostart enable
+```
+
+Dit zet `chronicle.exe start --tray` in de `Run`-sleutel van je eigen
+Windows-account (`HKCU\...\Run`) — geen adminrechten nodig, en het start pas
+ná inloggen (dus met je bureaublad en schermen al actief). `chronicle
+autostart disable` zet het weer uit; `chronicle autostart status` laat zien
+wat er nu staat.
 
 `doctor` probeert UIA op al je open vensters én doet een echte OCR-proefopname,
 met tijden erbij — de snelste manier om je drempels te ijken.

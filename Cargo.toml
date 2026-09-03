@@ -21,9 +21,11 @@ tokio-postgres = { version = "0.7.15", features = ["with-chrono-0_4"] }
 toml = "1.1.4"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+tray-icon = "0.24.2"
 uuid = { version = "1.19.0", features = ["v4", "serde"] }
 windows = { version = "0.62.2", features = ["Foundation", "Globalization", "Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_System_Com", "Win32_System_SystemInformation", "Win32_System_ProcessStatus", "Security_Cryptography", "Win32_UI_Accessibility", "Win32_System_Variant", "Win32_System_Ole", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_HiDpi"] }
 windows-core = "0.62.2"
+winreg = "0.56.0"
 xcap = "0.9.8"
 fastembed = "6.0.2"
 
