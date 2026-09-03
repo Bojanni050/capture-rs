@@ -34,6 +34,10 @@ tempfile = "3.27.0"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
+# Geen lto/codegen-units=1: die combinatie veroorzaakte een reproduceerbare
+# heap-corruption crash (STATUS_HEAP_CORRUPTION, altijd binnen ~15s na start)
+# die in een debug-build nooit optrad. De onderliggende race is niet
+# gevonden, maar zonder deze twee instellingen draaide de app 40+ minuten
+# probleemloos. Voeg ze niet terug zonder dit eerst te reproduceren en op te
+# lossen.
 strip = true
