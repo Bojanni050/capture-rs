@@ -1,6 +1,6 @@
 # Consolidatievoorstel: chronicle-rs & chroniclecapture
 
-> Status: voorstel ter beslissing · Aangemaakt: 2026-09-18 · Bijgewerkt: platform-strategie toegevoegd
+> Status: voorstel ter beslissing · Aangemaakt: 2026-09-18
 
 ## Doel
 
@@ -69,34 +69,10 @@ chronicle-rs/
 | Tray, autostart, lock | Tailwind-styling en componenten |
 | Embeddings-proposal | — |
 
-## Platform-strategie capture (mobiel)
-
-Doel op termijn: het digitale leven volledig in kaart brengen, dus ook Android en iOS. Haalbaarheid verschilt fundamenteel per platform — continue screen-capture zoals op Windows bestaat op mobiel niet.
-
-### Android — beperkt mogelijk
-
-- **Accessibility Service**: kan schermtekst lezen (dichtstbijzijnde tegenhanger van UIA), maar Google weigert Play Store-toelating voor apps die dit als logging "misbruiken"; side-loading/eigen distributie is vaak de realiteit.
-- **UsageStatsManager**: app-gebruik per tijdsinterval (metadata, geen inhoud).
-- **Share-sheet / Intent**: gebruiker deelt handmatig tekst, links, bestanden.
-- Foreground screen recording + on-device OCR kan, maar is batterij-intensief.
-
-### iOS — zeer restrictief
-
-- Geen publieke API om inhoud van andere apps op de achtergrond te lezen; geen Accessibility Service, geen scherm-scraping, geen globale OCR.
-- Wél mogelijk: handmatige **share-extension**, **Shortcuts/Automations** (met gebruikersbevestiging), en gescreende aggregaten via **DeviceActivityFramework** (app-namen + tijden, geen inhoud).
-
-### Realistische drielaagse opbouw
-
-1. **Direct**: share-sheet/Shortcuts-capture — de mens geeft expliciet door wat ertoe doet. Dit past juist beter bij het manifest: menselijke intentie als bron, geen stille waarneming.
-2. **Metadata**: app-gebruik en tijden via UsageStats (Android) / DeviceActivity (iOS).
-3. **Indirect (grootste vangst)**: automatische import uit cloud-bronnen — Gmail, Drive, agenda's, notities. Het meeste mobiele gedrag laat sporen na in de cloud; via API's volledig toegankelijk.
-
-Mobiele clients worden in de Gaia-architectuur representaties van één Gaia (Gaia Cloud), die dezelfde Hindsight voeden — alleen de capture-methode verschilt per platform. Concreet betekent dit voor chronicle-rs: definieer de engine-invoer als een **generiek capture-eventcontract** (platform-agnostisch), zodat Windows-capture, Android- en iOS-clients en cloud-importers allemaal dezelfde pijplijn (filter → store → embeddings) voeden.
-
 ## Risico's & aandachtspunten
 
 - **Scope van "screenpipe":** als chroniclecapture's engine diep verweven is met Screenpipe-upstream, is "zelf onderhouden" (chronicle-rs) vs. "meeliften met upstream" een strategische keuze. Zelf onderhouden past beter bij het manifest, maar kost meer tijd.
-- **Windows-only:** UIA is Windows-specifiek; documenteer dit als expliciete scope-keuze. Het generieke capture-eventcontract (zie Platform-strategie) maakt per-OS implementaties later mogelijk.
+- **Windows-only:** UIA is Windows-specifiek; documenteer dit als expliciete scope-keuze (of plan later een capture-trait met per-OS implementaties).
 - **Eén schema:** twee eigen opslagmodellen betekent tijdelijk dubbele data-formaten — migreer in één keer, niet geleidelijk.
 - **Naamgeving:** overweeg de module in chronicle-rs gewoon `capture` te laten heten (bestaat al) zodat de naamruimte één-talig blijft.
 
@@ -104,4 +80,28 @@ Mobiele clients worden in de Gaia-architectuur representaties van één Gaia (Ga
 
 1. Capture-laag volledig zelf onderhouden (chronicle-rs) of meeliften met Screenpipe-upstream?
 2. Bevestiging van dit voorstel als beslissingsdocument: **chronicle-rs = engine, chroniclecapture = UI-donor**.
-3. Prioritering mobiel: Android eerst (meer mogelijkheden) of cloud-import eerst (grootste vangst, minste platformrisico)?
+
+
+## Platform-strategie capture (mobiel)
+
+Het digitale leven volledig in kaart brengen vereist op termijn ook Android- en iOS-clients. De haalbaarheid verschilt fundamenteel per platform — continue screen-capture zoals op Windows (UIA + OCR) bestaat op mobiel niet.
+
+### Android — beperkt mogelijk
+
+- **Accessibility Service**: kan schermtekst lezen (dichtstbijzijnde tegenhanger van UIA). Kanttekening: Google weigert Play Store-toelating voor logging-gebruik zonder duidelijke gebruikersfunctie; side-loading of eigen distributie is vaak de realiteit.
+- **UsageStatsManager**: app-gebruik per tijdsinterval (metadata, geen inhoud).
+- **Share-sheet / Intent**: gebruiker deelt tekst, links of bestanden handmatig.
+- Foreground screen recording + on-device OCR kan, maar is batterij-intensief.
+
+### iOS — vrijwel onmogelijk voor continue capture
+
+- Geen publieke API om inhoud van andere apps op de achtergrond te lezen; geen Accessibility Service, geen scherm-scraping, geen globale OCR.
+- Wél mogelijk: handmatige **share-extension**, **Shortcuts/Automations** (met gebruikersbevestiging), en aggregaten via **DeviceActivityFramework** (app-namen en tijden, geen inhoud).
+
+### Drielaagse mobiele strategie
+
+1. **Direct**: share-sheet/Shortcuts-capture — de mens geeft expliciet door wat ertoe doet (past bij het manifest: menselijke intentie als bron).
+2. **Metadata**: app-gebruik en tijden via UsageStats/DeviceActivity.
+3. **Indirect (grootste vangst)**: automatische import uit cloud-bronnen — Gmail, Drive, agenda's, notities. Het meeste mobiele gedrag laat sporen na in de cloud; die zijn via API's wél volledig toegankelijk.
+
+Mobiele clients worden binnen de Gaia-architectuur representaties van dezelfde Gaia in Gaia Cloud; alleen de capture-methode verschilt per platform. De engine-API (stap 3 van het stappenplan) moet daarom platform-neutraal zijn: clients leveren gestandaardiseerde observaties aan, ongeacht of die via UIA, share-sheet of cloud-import zijn verkregen.
