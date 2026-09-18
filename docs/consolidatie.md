@@ -81,7 +81,6 @@ chronicle-rs/
 1. Capture-laag volledig zelf onderhouden (chronicle-rs) of meeliften met Screenpipe-upstream?
 2. Bevestiging van dit voorstel als beslissingsdocument: **chronicle-rs = engine, chroniclecapture = UI-donor**.
 
-
 ## Platform-strategie capture (mobiel)
 
 Het digitale leven volledig in kaart brengen vereist op termijn ook Android- en iOS-clients. De haalbaarheid verschilt fundamenteel per platform — continue screen-capture zoals op Windows (UIA + OCR) bestaat op mobiel niet.
@@ -105,3 +104,40 @@ Het digitale leven volledig in kaart brengen vereist op termijn ook Android- en 
 3. **Indirect (grootste vangst)**: automatische import uit cloud-bronnen — Gmail, Drive, agenda's, notities. Het meeste mobiele gedrag laat sporen na in de cloud; die zijn via API's wél volledig toegankelijk.
 
 Mobiele clients worden binnen de Gaia-architectuur representaties van dezelfde Gaia in Gaia Cloud; alleen de capture-methode verschilt per platform. De engine-API (stap 3 van het stappenplan) moet daarom platform-neutraal zijn: clients leveren gestandaardiseerde observaties aan, ongeacht of die via UIA, share-sheet of cloud-import zijn verkregen.
+## Ingestie-architectuur: één convergentiepunt
+
+Alle observatiestromen — desktop-capture, mobiele capture (Android/iOS), AI-chatarchieven en toekomstige bronnen — komen samen in **één ingestiepunt** in de engine. Dit is de logische plek waar chronicle-rs' server-API en de knowledge-engine elkaar raken.
+
+### Waarom één punt
+
+- **Eén statusmarkering**: alle input doorloopt dezelfde Trust-domein-controle (observation/interpretation/hypothesis/...) op één plek, in plaats van per client geïmplementeerd — het manifest verbiedt immers dat interpretaties als feiten naar buiten treden.
+- **Eén ruisfilter**: het vierlagen-filter en deduplicatie werken op alle bronnen uniform, ongeacht of een observatie via UIA, share-sheet of cloud-import binnenkomt.
+- **Eén eventing/schema**: clients hoeven alleen gestandaardiseerde observaties te sturen; alle verwerking (pipeline, embeddings, opslag) is brononafhankelijk.
+
+### Conceptueel model
+
+```
+[desktop capture]   [mobiel capture]   [AI-chatarchieven]   [cloud-import]
+       │                   │                  │                  │
+       └───────────────────┴────────┬─────────┴──────────────────┘
+                                   ▼
+                        ┌─────────────────────┐
+                        │   Ingestie Gateway   │  (één API, één contract)
+                        │  - normalisatie      │
+                        │  - deduplicatie      │
+                        │  - statusmarkering   │
+                        │  - ruisfilter        │
+                        └──────────┬──────────┘
+                                   ▼
+                        ┌─────────────────────┐
+                        │  Pipeline / Store    │
+                        │  (kennisvorming)     │
+                        └─────────────────────┘
+```
+
+### Ontwerpeisen
+
+- **Contract-first**: definieer eerst het observatie-formaat (source, timestamp, content, context, confidence) vóórdat clients worden gebouwd — dit is de concrete invulling van "platform-neutraal" uit de vorige sectie.
+- **Bron-provenance**: elke observatie draagt zijn herkomst (device, app, capture-methode) mee — nodig voor latere bias-analyse en het Bias Inference Framework.
+- **Push én pull**: desktop pusht continue; mobiele clients pushen opportunistisch (batterij/connectiviteit); cloud-import trekt periodiek. De gateway moet beide patronen aankunnen.
+- **Toekomstbestendig**: nieuwe bronnen (bijv. email, muziekgedrag, locatie) zijn alleen nieuwe adapters, geen architectuurwijziging.
