@@ -249,6 +249,7 @@ impl Default for FilterConfig {
                 "consent",
                 "lsass",
                 "logonui",
+                "chronicle",
             ]
             .iter()
             .map(|s| s.to_string())
