@@ -1,0 +1,26 @@
+services:
+  selection-pass:
+    build: .
+    container_name: selection-pass
+    restart: unless-stopped
+    environment:
+      - STASH_DB_PATH=/data/stash.sqlite3
+      - STATE_DB_PATH=/state/selection.sqlite3
+      - HINDSIGHT_URL=http://${TAILSCALE_IP:?set TAILSCALE_IP in .env}:8888
+      - HINDSIGHT_BANK_ID=${HINDSIGHT_BANK_ID:-bojan}
+      - RUN_INTERVAL_SEC=${RUN_INTERVAL_SEC:-1800}
+      - RELEVANCE_FILTER_ENABLED=${RELEVANCE_FILTER_ENABLED:-true}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://openrouter.ai/api/v1}
+      - LLM_MODEL=${LLM_MODEL:-deepseek/deepseek-v4-flash}
+    volumes:
+      - stash-data:/data:ro
+      - selection-state:/state
+
+volumes:
+  # References the volume stash-ingest already created -- this container
+  # only needs read access to the same SQLite file, not its own copy.
+  stash-data:
+    external: true
+    name: stash-ingest_stash-data
+  selection-state:

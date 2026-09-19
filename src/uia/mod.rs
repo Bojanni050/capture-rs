@@ -50,6 +50,9 @@ pub enum Outcome {
     Text(Vec<String>),
     /// Geen bruikbaar resultaat; de reden is bedoeld voor logs en statistiek.
     Unavailable(&'static str),
+    /// Het venster bevat een wachtwoordveld. Geen tekst, geen OCR: de
+    /// pipeline sluit het venster (of domein) uit.
+    PasswordField,
 }
 
 /// Wat we per app onthouden over de bruikbaarheid van UIA.
@@ -195,6 +198,10 @@ impl UiaService {
                 return Outcome::Unavailable("uia-timeout");
             }
         };
+
+        if read.password_field {
+            return Outcome::PasswordField;
+        }
 
         if read.chars() < self.cfg.min_text_len {
             self.record_failure(app_key);

@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::path::Path;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -154,6 +154,9 @@ impl Db {
         if version < 3 {
             Self::migrate_v3(&conn)?;
         }
+        if version < 4 {
+            Self::migrate_v4(&conn)?;
+        }
 
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
@@ -253,6 +256,30 @@ impl Db {
         Ok(())
     }
 
+    /// v4: uitsluitingen (per app, venster of domein; sticky tot je ze zelf
+    /// verwijdert) en de cursor van de Stash-shipper.
+    ///
+    /// De cursor-rij ontbreekt bewust tot de shipper voor het eerst draait: hij
+    /// begint dan bij de nieuwste capture in plaats van de hele historie naar
+    /// een LLM-curatiestraat te sturen.
+    fn migrate_v4(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS excluded (
+                key        TEXT NOT NULL,
+                kind       TEXT NOT NULL,
+                reason     TEXT NOT NULL,
+                first_seen INTEGER NOT NULL,
+                PRIMARY KEY (kind, key)
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS ship_cursor (
+                id           INTEGER PRIMARY KEY CHECK (id = 1),
+                last_seen_id INTEGER NOT NULL
+             );",
+        )
+        .context("migratie naar schema v4 mislukt")?;
+        Ok(())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         // Een vergiftigde mutex betekent dat een andere thread paniekte terwijl
         // hij de verbinding vasthield; doorgaan is veiliger dan hier crashen.
@@ -280,6 +307,16 @@ impl Db {
             params![app_id, title, ts],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Verwijdert een segment dat nog niets bevat. Gebruikt als een venster
+    /// achteraf uitgesloten blijkt: dan hoort ook zijn titel niet in het archief.
+    pub fn discard_segment_if_empty(&self, segment_id: i64) -> Result<()> {
+        self.lock().execute(
+            "DELETE FROM segments WHERE id = ?1 AND captures = 0",
+            params![segment_id],
+        )?;
+        Ok(())
     }
 
     /// Verlengt een segment zonder een nieuwe capture; gebruikt wanneer het
@@ -797,6 +834,77 @@ impl Db {
         Ok(())
     }
 
+    // --- uitsluitingen ----------------------------------------------------
+
+    pub fn is_excluded(&self, kind: &str, key: &str) -> Result<bool> {
+        let hit = self
+            .lock()
+            .query_row(
+                "SELECT 1 FROM excluded WHERE kind = ?1 AND key = ?2",
+                params![kind, key.to_lowercase()],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
+    /// Geeft `true` als de uitsluiting nieuw was.
+    pub fn mark_excluded(&self, kind: &str, key: &str, reason: &str, ts: i64) -> Result<bool> {
+        let n = self.lock().execute(
+            "INSERT OR IGNORE INTO excluded(key, kind, reason, first_seen) VALUES (?1, ?2, ?3, ?4)",
+            params![key.to_lowercase(), kind, reason, ts],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Geeft `true` als er iets verwijderd werd.
+    pub fn unexclude(&self, kind: &str, key: &str) -> Result<bool> {
+        let n = self.lock().execute(
+            "DELETE FROM excluded WHERE kind = ?1 AND key = ?2",
+            params![kind, key.to_lowercase()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// (kind, key, reason, first_seen), nieuwste eerst.
+    pub fn list_excluded(&self) -> Result<Vec<(String, String, String, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT kind, key, reason, first_seen FROM excluded ORDER BY first_seen DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    // --- shipper ----------------------------------------------------------
+
+    /// De laatst verzonden capture-id, of `None` als de shipper nog nooit liep.
+    pub fn load_ship_cursor(&self) -> Result<Option<i64>> {
+        Ok(self
+            .lock()
+            .query_row("SELECT last_seen_id FROM ship_cursor WHERE id = 1", [], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn save_ship_cursor(&self, last_seen_id: i64) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO ship_cursor(id, last_seen_id) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET last_seen_id = excluded.last_seen_id",
+            params![last_seen_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn max_capture_id(&self) -> Result<i64> {
+        Ok(self
+            .lock()
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM captures", [], |r| r.get(0))?)
+    }
+
     /// Expose lock voor indexer (pub(crate) via wrapper).
     pub(crate) fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.lock()
@@ -998,6 +1106,46 @@ mod tests {
         assert_eq!(loaded[0].0, "code");
         assert_eq!(loaded[0].1, 120);
         assert_eq!(loaded[0].2[0].2, 118);
+    }
+
+    #[test]
+    fn uitsluiting_is_hoofdletterongevoelig_en_sticky() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(!db.is_excluded("domain", "MijnBank.com").unwrap());
+        assert!(db.mark_excluded("domain", "MijnBank.com", "password_field", 1).unwrap());
+        assert!(!db.mark_excluded("domain", "mijnbank.com", "password_field", 2).unwrap());
+        assert!(db.is_excluded("domain", "mijnbank.COM").unwrap());
+        // Zelfde sleutel als ander soort is een andere uitsluiting.
+        assert!(!db.is_excluded("app", "mijnbank.com").unwrap());
+        assert_eq!(db.list_excluded().unwrap().len(), 1);
+        assert!(db.unexclude("domain", "mijnbank.com").unwrap());
+        assert!(!db.is_excluded("domain", "mijnbank.com").unwrap());
+        assert!(!db.unexclude("domain", "mijnbank.com").unwrap());
+    }
+
+    #[test]
+    fn leeg_segment_verdwijnt_maar_een_gevuld_segment_blijft() {
+        let db = Db::open_in_memory().unwrap();
+        let app_id = db.app_id("bank", "bank.exe", "").unwrap();
+        let leeg = db.open_segment(app_id, "Inloggen bij de bank", 1000).unwrap();
+        db.discard_segment_if_empty(leeg).unwrap();
+        assert!(db.timeline(0, 10_000).unwrap().is_empty());
+
+        seed(&db, 2000, "code", "main.rs", "werk", "text");
+        let segmenten = db.timeline(0, 10_000).unwrap();
+        db.discard_segment_if_empty(segmenten[0].id).unwrap();
+        assert_eq!(db.timeline(0, 10_000).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ship_cursor_bestaat_pas_na_opslaan() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.load_ship_cursor().unwrap(), None);
+        seed(&db, 1000, "code", "main.rs", "werk", "text");
+        assert_eq!(db.max_capture_id().unwrap(), 1);
+        db.save_ship_cursor(1).unwrap();
+        db.save_ship_cursor(7).unwrap();
+        assert_eq!(db.load_ship_cursor().unwrap(), Some(7));
     }
 
     #[test]

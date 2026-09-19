@@ -25,6 +25,7 @@
 //!    ontwerptool), dan bewaren we het frame zelf, zodat er nooit een gat in
 //!    je tijdlijn valt.
 
+use crate::browser::BrowserState;
 use crate::capture::{
     ForegroundEvents, Rect, ScreenCapturer, WindowInfo, foreground, foreground_hwnd, idle_seconds,
     window_rect,
@@ -80,6 +81,7 @@ impl Source {
 struct FrameContext<'a> {
     segment_id: i64,
     app_key: &'a str,
+    title: &'a str,
     hwnd: isize,
     monitor: &'a str,
     ts: i64,
@@ -92,6 +94,8 @@ struct TextRead {
     source: Source,
     /// Waarom een eerdere bron afviel; belandt in `fallback_reason`.
     note: Option<String>,
+    /// UIA vond een wachtwoordveld: niets van dit venster bewaren.
+    password: bool,
 }
 
 pub struct Pipeline {
@@ -107,6 +111,7 @@ pub struct Pipeline {
     ticks: u64,
     last_hwnd: Option<isize>,
     tray: Option<TrayStatus>,
+    browser: Option<Arc<BrowserState>>,
 }
 
 impl Pipeline {
@@ -163,6 +168,7 @@ impl Pipeline {
             ticks: 0,
             last_hwnd: None,
             tray: None,
+            browser: None,
         })
     }
 
@@ -174,6 +180,11 @@ impl Pipeline {
     /// (groen = actief, geel = idle, rood = de tik mislukte).
     pub fn attach_tray(&mut self, tray: TrayStatus) {
         self.tray = Some(tray);
+    }
+
+    /// Koppelt de browserbridge zodat sites per domein kunnen worden uitgesloten.
+    pub fn attach_browser(&mut self, browser: Arc<BrowserState>) {
+        self.browser = Some(browser);
     }
 
     /// Draait tot `shutdown` afgaat.
@@ -283,6 +294,14 @@ impl Pipeline {
         let window = window.expect("gate laat None niet door");
 
         let app_key = window.app_key();
+
+        if let Some(reason) = self.excluded_reason(&window, &app_key)? {
+            self.db
+                .record_skip(&now.format("%Y-%m-%d").to_string(), reason)?;
+            self.segment = None;
+            return Ok(());
+        }
+
         let app_id = self.app_id(&window)?;
         let segment_id = self.segment_for(app_id, &app_key, &window.title, ts)?;
 
@@ -353,10 +372,12 @@ impl Pipeline {
                 None => shot.image,
             };
 
-            self.process_frame(
+            let password_found = self
+                .process_frame(
                 FrameContext {
                     segment_id,
                     app_key: &app_key,
+                    title: &window.title,
                     hwnd: window.hwnd,
                     monitor: &shot.monitor,
                     ts,
@@ -365,6 +386,10 @@ impl Pipeline {
                 image,
             )
             .await?;
+            if password_found {
+                // Geen tweede scherm van dit venster meer lezen.
+                break;
+            }
         }
 
         if self.ticks.is_multiple_of(FLUSH_EVERY) {
@@ -377,10 +402,11 @@ impl Pipeline {
         &mut self,
         ctx: FrameContext<'_>,
         image: RgbaImage,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let FrameContext {
             segment_id,
             app_key,
+            title,
             hwnd,
             monitor,
             ts,
@@ -394,7 +420,7 @@ impl Pipeline {
         if self.filter.frame_is_duplicate(&scope, hash) {
             self.db.touch_segment(segment_id, ts)?;
             self.db.record_skip(&day, "onveranderd beeld")?;
-            return Ok(());
+            return Ok(false);
         }
 
         // Laag 3: lezen wat er staat — eerst de accessibility-boom, dan OCR.
@@ -406,6 +432,10 @@ impl Pipeline {
         } else {
             self.read_ocr(&image, None).await
         };
+        if read.password {
+            self.exclude_after_password(app_key, title, &day, segment_id)?;
+            return Ok(true);
+        }
         // De teksttoestand is per scherm wanneer we alle monitoren opnemen.
         // Anders zou gelijke tekst op monitor 1 monitor 2 als herhaling
         // wegdrukken voordat die tweede capture opgeslagen wordt.
@@ -417,7 +447,7 @@ impl Pipeline {
         if analysis.same_as_previous {
             self.db.touch_segment(segment_id, ts)?;
             self.db.record_skip(&day, "zelfde tekst")?;
-            return Ok(());
+            return Ok(false);
         }
 
         // Laag 4: vertrouwen we deze tekst, of vallen we terug op het beeld?
@@ -479,7 +509,7 @@ impl Pipeline {
         if kind == "image" && frame.is_none() {
             self.db.touch_segment(segment_id, ts)?;
             self.db.record_skip(&day, "geen bruikbare inhoud")?;
-            return Ok(());
+            return Ok(false);
         }
 
         let (frame_path, width, height) = match &frame {
@@ -512,7 +542,7 @@ impl Pipeline {
             boilerplate = analysis.boilerplate_lines,
             "vastgelegd"
         );
-        Ok(())
+        Ok(false)
     }
 
     /// Haalt tekst op via UIA en valt bij een onbruikbare boom terug op OCR.
@@ -526,6 +556,15 @@ impl Pipeline {
                         lines,
                         source: Source::Uia,
                         note: None,
+                        password: false,
+                    };
+                }
+                uia::Outcome::PasswordField => {
+                    return TextRead {
+                        lines: Vec::new(),
+                        source: Source::None,
+                        note: None,
+                        password: true,
                     };
                 }
                 uia::Outcome::Unavailable(reason) => {
@@ -547,6 +586,7 @@ impl Pipeline {
                         lines: raw.lines,
                         source: Source::Ocr,
                         note,
+                        password: false,
                     };
                 }
                 Err(e) => {
@@ -555,6 +595,7 @@ impl Pipeline {
                         lines: Vec::new(),
                         source: Source::None,
                         note: Some(format!("OCR mislukt: {e}")),
+                        password: false,
                     };
                 }
             }
@@ -564,7 +605,81 @@ impl Pipeline {
             lines: Vec::new(),
             source: Source::None,
             note: Some(note.unwrap_or_else(|| "geen tekstbron actief".into())),
+            password: false,
         }
+    }
+
+    fn is_browser(&self, app_key: &str) -> bool {
+        self.cfg
+            .browser
+            .processes
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(app_key))
+    }
+
+    /// Hostnaam van het actieve tabblad volgens de extensie, alleen voor browsers.
+    fn browser_report(&self, app_key: &str) -> Option<(String, bool)> {
+        if !self.is_browser(app_key) {
+            return None;
+        }
+        let max_age = Duration::from_secs_f64(self.cfg.browser.max_age_secs.max(1.0));
+        self.browser.as_ref()?.current(max_age)
+    }
+
+    /// Is dit venster (of deze site) uitgesloten? Leert ook: meldt de extensie
+    /// een wachtwoordveld, dan wordt het hele domein vanaf nu uitgesloten.
+    fn excluded_reason(&mut self, window: &WindowInfo, app_key: &str) -> Result<Option<&'static str>> {
+        if self.db.is_excluded("app", app_key)? {
+            return Ok(Some("app uitgesloten"));
+        }
+        if self.db.is_excluded("window", &window_key(app_key, &window.title))? {
+            return Ok(Some("venster uitgesloten"));
+        }
+        if let Some((host, has_password_field)) = self.browser_report(app_key) {
+            if self.db.is_excluded("domain", &host)? {
+                return Ok(Some("domein uitgesloten"));
+            }
+            if has_password_field {
+                if self
+                    .db
+                    .mark_excluded("domain", &host, "password_field", Local::now().timestamp())?
+                {
+                    tracing::warn!(domein = host, "domein uitgesloten (wachtwoordveld in de pagina)");
+                }
+                return Ok(Some("domein uitgesloten"));
+            }
+        }
+        Ok(None)
+    }
+
+    /// UIA zag een wachtwoordveld. In een browser sluiten we het domein uit
+    /// (als de extensie er een kent); anders alleen dit venster, want een
+    /// hele app uitsluiten om één instellingenscherm sloopt de opname.
+    fn exclude_after_password(
+        &mut self,
+        app_key: &str,
+        title: &str,
+        day: &str,
+        segment_id: i64,
+    ) -> Result<()> {
+        let now = Local::now().timestamp();
+        match self.browser_report(app_key) {
+            Some((host, _)) => {
+                if self.db.mark_excluded("domain", &host, "password_field", now)? {
+                    tracing::warn!(domein = host, "domein uitgesloten (wachtwoordveld via uia)");
+                }
+            }
+            None => {
+                let key = window_key(app_key, title);
+                if self.db.mark_excluded("window", &key, "password_field", now)? {
+                    tracing::warn!(venster = key, "venster uitgesloten (wachtwoordveld via uia)");
+                }
+            }
+        }
+        self.db.record_skip(day, "wachtwoordveld")?;
+        self.db.discard_segment_if_empty(segment_id)?;
+        self.segment = None;
+        Ok(())
     }
 
     fn app_id(&mut self, window: &WindowInfo) -> Result<i64> {
@@ -614,6 +729,10 @@ impl Pipeline {
         }
         Ok(())
     }
+}
+
+fn window_key(app_key: &str, title: &str) -> String {
+    format!("{app_key}::{title}")
 }
 
 /// Snijdt een shot bij tot het snijvlak met `rect`, een vensterrechthoek in

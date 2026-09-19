@@ -1,0 +1,20 @@
+services:
+  stash-ingest:
+    build: .
+    container_name: stash-ingest
+    restart: unless-stopped
+    ports:
+      # Bind to the Tailscale IP only -- NOT 0.0.0.0. This host has no
+      # active firewall (ufw inactive, csf not found despite the leftover
+      # dir), so "0.0.0.0:8080:8080" means publicly reachable on the
+      # internet with zero auth. Match the pattern the existing Hindsight
+      # container on this box already uses.
+      - "${TAILSCALE_IP:?set TAILSCALE_IP in .env}:8080:8080"
+    environment:
+      - INGEST_DB_PATH=/data/stash.sqlite3
+      - INGEST_TOKEN=${INGEST_TOKEN:?set INGEST_TOKEN in .env}
+    volumes:
+      - stash-data:/data
+
+volumes:
+  stash-data:

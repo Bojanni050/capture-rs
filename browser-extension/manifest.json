@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Chronicle Browser Bridge",
+  "version": "1.1.0",
+  "description": "Meldt het domein van het actieve tabblad en of er een wachtwoordveld staat aan de lokale Chronicle-opname, zodat die per domein kan uitsluiten.",
+  "permissions": ["tabs"],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1:8765/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

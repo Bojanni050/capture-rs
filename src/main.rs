@@ -4,6 +4,7 @@
 //! het filter in `filter/mod.rs`.
 
 mod autostart;
+mod browser;
 mod capture;
 mod com;
 mod config;
@@ -13,6 +14,7 @@ mod lock;
 mod ocr;
 mod pipeline;
 mod server;
+mod ship;
 mod store;
 mod tray;
 mod uia;
@@ -119,6 +121,29 @@ enum Command {
         #[command(subcommand)]
         action: AutostartCommand,
     },
+    /// Beheer de uitsluitingslijst (apps, vensters en domeinen die nooit worden vastgelegd).
+    Exclude {
+        #[command(subcommand)]
+        action: ExcludeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExcludeCommand {
+    /// Toon alles wat is uitgesloten, ook wat Chronicle zelf leerde.
+    List,
+    /// Sluit iets uit: een app (`slack`), een domein (`mijnbank.nl`) of een venster (`app::titel`).
+    Add {
+        #[arg(value_parser = ["app", "domain", "window"])]
+        kind: String,
+        key: String,
+    },
+    /// Haal een uitsluiting weg. Chronicle doet dit nooit zelf: uitsluiten is sticky.
+    Remove {
+        #[arg(value_parser = ["app", "domain", "window"])]
+        kind: String,
+        key: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -205,6 +230,7 @@ async fn main() -> Result<()> {
             EmbeddingsCommand::Purge { older_than, yes } => cmd_embeddings_purge(cfg, older_than, yes).await,
         },
         Command::Autostart { action } => cmd_autostart(action),
+        Command::Exclude { action } => cmd_exclude(cfg, action),
     }
 }
 
@@ -290,10 +316,35 @@ async fn cmd_start(cfg: Config, no_server: bool, tray: bool) -> Result<()> {
     };
 
     let dashboard_url = format!("http://{}:{}", cfg.server.bind, cfg.server.port);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+
+    // De bridge draait los van `--no-server`: de extensie heeft hem nodig, ook
+    // als je de webinterface niet wilt.
+    let browser_state = if cfg.browser.enabled {
+        let state = Arc::new(browser::BrowserState::default());
+        match browser::serve(Arc::clone(&state), cfg.browser.port).await {
+            Ok(addr) => tracing::info!("browser-bridge op http://{addr}"),
+            Err(e) => tracing::warn!(
+                error = %e,
+                poort = cfg.browser.port,
+                "browser-bridge kon niet starten (draait er nog een oude CodexCapture-agent?); domeinuitsluiting werkt niet"
+            ),
+        }
+        Some(state)
+    } else {
+        None
+    };
+
+    let shipper_handle = cfg.ship.enabled.then(|| {
+        tokio::spawn(ship::run(cfg.ship.clone(), Arc::clone(&db), rx.clone()))
+    });
+
     let mut pipeline = pipeline::Pipeline::new(cfg, Arc::clone(&db), Arc::clone(&frames))?;
+    if let Some(state) = browser_state {
+        pipeline.attach_browser(state);
+    }
     tracing::info!(schermen = %pipeline.monitors(), "opname gestart — Ctrl+C om te stoppen");
 
-    let (tx, rx) = tokio::sync::watch::channel(false);
     let ctrlc_tx = tx.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -307,6 +358,10 @@ async fn cmd_start(cfg: Config, no_server: bool, tray: bool) -> Result<()> {
     }
 
     let res = pipeline.run(rx).await;
+
+    if let Some(handle) = shipper_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
 
     // Shutdown indexer netjes.
     if let Some((handle, idx_tx)) = indexer_handle {
@@ -559,6 +614,33 @@ fn cmd_doctor(cfg: Config, cfg_path: &std::path::Path) -> Result<()> {
     println!("Inactief sinds   {} s", capture::idle_seconds());
 
     println!();
+    let excluded = Db::open(&db_path).and_then(|db| db.list_excluded()).map(|l| l.len());
+    println!(
+        "Uitsluitingen    {}",
+        excluded.map_or_else(|e| format!("!! {e}"), |n| format!("{n} (zie `chronicle exclude list`)"))
+    );
+    println!(
+        "Browser-bridge   {}",
+        if cfg.browser.enabled {
+            format!("aan op 127.0.0.1:{} (extensie: browser-extension/)", cfg.browser.port)
+        } else {
+            "uit".to_string()
+        }
+    );
+    println!(
+        "Stash-shipping   {}",
+        if cfg.ship.enabled {
+            format!(
+                "aan → {} (token: {})",
+                cfg.ship.endpoint,
+                if cfg.ship.resolved_token().is_some() { "ingesteld" } else { "ONTBREEKT" }
+            )
+        } else {
+            "uit (alles blijft lokaal)".to_string()
+        }
+    );
+
+    println!();
     if let Err(e) = proef_uia(&cfg) {
         println!("  !! UIA:        {e}");
     }
@@ -693,6 +775,41 @@ fn cmd_config(cfg: Config, path: &std::path::Path, init: bool) -> Result<()> {
         println!("# (bestaat nog niet — dit zijn de defaults; `chronicle config --init` schrijft ze weg)");
     }
     println!("{}", toml::to_string_pretty(&cfg)?);
+    Ok(())
+}
+
+fn cmd_exclude(cfg: Config, action: ExcludeCommand) -> Result<()> {
+    let (db, _) = open_store(&cfg)?;
+    match action {
+        ExcludeCommand::List => {
+            let rows = db.list_excluded()?;
+            if rows.is_empty() {
+                println!("Niets uitgesloten.");
+            }
+            for (kind, key, reason, first_seen) in rows {
+                let reden = if reason == "password_field" {
+                    "wachtwoordveld (automatisch)"
+                } else {
+                    "handmatig"
+                };
+                println!("{kind:<7} {}  {key}  — {reden}", fmt_ts(first_seen));
+            }
+        }
+        ExcludeCommand::Add { kind, key } => {
+            let new = db.mark_excluded(&kind, &key, "manual", Local::now().timestamp())?;
+            println!(
+                "{}",
+                if new { "Uitgesloten." } else { "Stond al op de lijst." }
+            );
+        }
+        ExcludeCommand::Remove { kind, key } => {
+            let removed = db.unexclude(&kind, &key)?;
+            println!(
+                "{}",
+                if removed { "Uitsluiting opgeheven." } else { "Stond niet op de lijst." }
+            );
+        }
+    }
     Ok(())
 }
 

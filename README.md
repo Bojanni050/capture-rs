@@ -43,7 +43,7 @@ elke laag die iets afvangt, bespaart de laag erna:
 
 | Laag | Vraag | Wat het afvangt |
 |---|---|---|
-| **1. Poort** | Mag dit venster überhaupt? | Idle (geen toets/muis), wachtwoordkluizen, incognito-vensters |
+| **1. Poort** | Mag dit venster überhaupt? | Idle (geen toets/muis), wachtwoordkluizen, incognito-vensters, uitgesloten apps/vensters/domeinen |
 | **2. Beeld** | Is er iets veranderd? | Stilstaande schermen — een dHash-vergelijking vóór de dure OCR |
 | **3. Tekst** | Wat hiervan is inhoud? | Terugkerende menubalken en statusbalken, per app afgeleerd |
 | **4. Redactie** | Mag dit bewaard worden? | Creditcards, IBAN's, `password:`-regels, API-tokens |
@@ -118,6 +118,40 @@ ná het ruisfilter nog genoeg inhoud over is.
 
 Zo valt er nooit een gat in je tijdlijn: je hebt óf de tekst, óf het beeld. Je
 ziet de reden terug in de webinterface bij elk beeld-item.
+
+## Wachtwoordvelden en de uitsluitingslijst
+
+Twee signalen leren Chronicle wat het nooit mag vastleggen, zonder dat jij een
+lijst met banken bijhoudt:
+
+- **UIA `IsPassword`** — staat er ergens in de accessibility-boom van het
+  venster een wachtwoordveld (ook buiten beeld gescrolld), dan wordt er niets
+  van dat venster bewaard: geen tekst, geen OCR, geen beeld, en ook het lege
+  segment met de venstertitel wordt weer weggegooid. Het **venster** (`app::titel`)
+  komt op de uitsluitingslijst, niet de hele app: één instellingenscherm met een
+  API-sleutelveld mag Word of je mailclient niet voorgoed stilleggen.
+- **Browserextensie** — UIA ziet in een browser alleen een wachtwoordveld
+  zolang het in beeld is, en weet niet welke site het is. De extensie in
+  `browser-extension/` meldt de hostnaam van het actieve tabblad en of de
+  DOM een `input[type=password]` heeft. Daarmee wordt het hele **domein**
+  uitgesloten, dus ook de pagina's ná het inloggen. Zie
+  [`browser-extension/README.md`](browser-extension/README.md) voor installeren.
+  Zonder extensie werkt in browsers alleen de UIA-controle (per venstertitel).
+
+Uitsluiten is **sticky**: wat er eenmaal op staat blijft staan tot jij het
+weghaalt. Een dashboard dat na het inloggen geen wachtwoordveld meer toont mag
+niet stilletjes weer meedoen.
+
+```bash
+chronicle exclude list
+chronicle exclude add domain mijnbank.nl
+chronicle exclude add app slack
+chronicle exclude remove domain github.com   # bv. als het te grof bleek
+```
+
+Beperking: bij `monitor = "all"` staat UIA uit (zie hieronder), dus dan is er
+geen wachtwoordveld-detectie via UIA; alleen de browserextensie en de denylists
+werken dan nog.
 
 ## Alleen het voorgrondvenster, nooit wat eromheen staat
 
@@ -239,6 +273,16 @@ boilerplate_ratio = 0.6    # regel in >60% van de frames = vaste UI
 app_denylist = ["bitwarden", "keepass", "1password", ...]
 redact = true
 
+[browser]
+enabled = true             # bridge voor de browserextensie
+port = 8765                # zie browser-extension/README.md
+max_age_secs = 15.0        # oudere meldingen vertrouwen we niet
+
+[ship]
+enabled = false            # true = gefilterde tekst naar je Stash sturen
+endpoint = "http://100.64.144.93:8080/ingest"
+interval_secs = 300.0      # token: env STASH_AUTH_TOKEN of auth_token = "..."
+
 [storage]
 keep_frames = "fallback"   # "always" | "fallback" | "never"
 retention_days = 45        # alles ouder dan dit verdwijnt
@@ -285,8 +329,33 @@ src/
   store/      SQLite + FTS5, en frames als JPEG op schijf
   embeddings/ semantische laag (experimenteel, uit by default — zie hieronder)
   server/     axum: JSON-API en de ingebouwde webpagina
+  browser.rs  bridge naar de browserextensie (alleen extensies, alleen 127.0.0.1)
+  ship.rs     optionele shipper naar Stash, met cursor in SQLite
   pipeline.rs de opnamelus die alles aan elkaar knoopt
+browser-extension/  MV3-extensie: domein + wachtwoordveld van het actieve tabblad
+deploy/
+  stash-ingest/    ruwe buffer op je VPS (Flask + SQLite, alleen Tailscale)
+  selection-pass/  LLM-relevantiefilter: Stash -> Hindsight
 ```
+
+## Stash en Hindsight (optioneel)
+
+Standaard blijft alles op deze machine. Wil je ook een curatiestraat, zet dan
+`[ship] enabled = true`. Chronicle stuurt elke 5 minuten de nieuwe
+`index_text` (dus zonder terugkerende menubalken en zonder gevoelige patronen)
+als NDJSON naar `deploy/stash-ingest`; `deploy/selection-pass` bundelt dat op
+je VPS tot episodes, laat een LLM beslissen wat het onthouden waard is en
+bewaart de rest in Hindsight. Installatie van beide staat in hun eigen README.
+
+- De **eerste keer** begint de shipper bij de nieuwste capture, niet bij de
+  hele historie.
+- Een cursor in SQLite schuift pas op nadat Stash de batch met 2xx bevestigde;
+  bij een storing wordt dezelfde batch de volgende ronde opnieuw verstuurd.
+- Alleen `http://`: het is bedoeld voor Tailscale. Het token komt uit de
+  omgevingsvariabele `STASH_AUTH_TOKEN` (of `ship.auth_token`).
+- Stash dedupliceert op (tijdstip, app, venstertitel); bij `monitor = "all"`
+  kunnen twee schermen met dezelfde titel binnen dezelfde seconde dus één rij
+  worden.
 
 ## Semantisch zoeken (experimenteel)
 
@@ -309,9 +378,11 @@ het aanzet.
 
 ## Privacy
 
-Alles blijft lokaal: SQLite en JPEG's onder
+Standaard blijft alles lokaal: SQLite en JPEG's onder
 `%LOCALAPPDATA%\ChronicleCapture\data`. Er gaat niets naar buiten en er zit geen
-telemetrie in.
+telemetrie in. De enige uitzondering is de shipper (`[ship] enabled = true`),
+die uit staat tot jij hem aanzet en dan alleen gefilterde tekst naar jouw eigen
+Stash stuurt.
 
 Wat je zelf moet weten: dit legt vast wat er op je scherm staat. De denylist en
 de redactie vangen de voor de hand liggende gevallen af, maar niet alles.

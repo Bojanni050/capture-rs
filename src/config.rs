@@ -19,7 +19,68 @@ pub struct Config {
     pub filter: FilterConfig,
     pub storage: StorageConfig,
     pub server: ServerConfig,
+    pub browser: BrowserConfig,
+    pub ship: ShipConfig,
     pub embeddings: EmbeddingsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrowserConfig {
+    /// Lokale bridge waar de browserextensie domein + wachtwoordveld meldt.
+    pub enabled: bool,
+    pub port: u16,
+    /// Een melding ouder dan dit vertrouwen we niet meer (extensie weg, tab
+    /// niet meer actief). De extensie stuurt elke 5 s een hartslag.
+    pub max_age_secs: f64,
+    /// Procesnamen (kleine letters, zonder .exe) die als browser tellen.
+    pub processes: Vec<String>,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 8765,
+            max_age_secs: 15.0,
+            processes: ["chrome", "msedge", "firefox", "brave", "opera", "vivaldi"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShipConfig {
+    /// Stuur gefilterde tekst naar een Stash-ingest (VPS). Standaard uit:
+    /// zonder dit blijft alles op deze machine.
+    pub enabled: bool,
+    pub endpoint: String,
+    /// Bearer-token; leeg = uit de omgevingsvariabele `STASH_AUTH_TOKEN`.
+    pub auth_token: Option<String>,
+    pub interval_secs: f64,
+}
+
+impl Default for ShipConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "http://100.64.144.93:8080/ingest".into(),
+            auth_token: None,
+            interval_secs: 300.0,
+        }
+    }
+}
+
+impl ShipConfig {
+    pub fn resolved_token(&self) -> Option<String> {
+        self.auth_token
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| std::env::var("STASH_AUTH_TOKEN").ok().filter(|t| !t.trim().is_empty()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +401,16 @@ impl Config {
         }
         if self.uia.timeout_ms == 0 || self.uia.timeout_ms > 30_000 {
             return Err(anyhow!("uia.timeout_ms moet 1..30000 zijn"));
+        }
+        if self.ship.enabled {
+            if !(10.0..=86_400.0).contains(&self.ship.interval_secs) {
+                return Err(anyhow!("ship.interval_secs moet 10..86400 zijn"));
+            }
+            if !self.ship.endpoint.starts_with("http://") {
+                return Err(anyhow!(
+                    "ship.endpoint moet met http:// beginnen (alleen over Tailscale; geen TLS-client ingebouwd)"
+                ));
+            }
         }
         if self.embeddings.enabled {
             if self.embeddings.dimensions == 0 || self.embeddings.dimensions > 4096 {

@@ -24,7 +24,8 @@ use windows::Win32::UI::Accessibility::{
     IUIAutomationElement, IUIAutomationTextPattern, IUIAutomationValuePattern,
     TreeScope_Subtree, UIA_ControlTypePropertyId, UIA_CONTROLTYPE_ID,
     UIA_DataItemControlTypeId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
-    UIA_HyperlinkControlTypeId, UIA_IsOffscreenPropertyId, UIA_ListItemControlTypeId,
+    UIA_HyperlinkControlTypeId, UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
+    UIA_ListItemControlTypeId,
     UIA_MenuItemControlTypeId, UIA_NamePropertyId, UIA_TabItemControlTypeId,
     UIA_TextControlTypeId, UIA_TextPatternId, UIA_TreeItemControlTypeId, UIA_ValuePatternId,
 };
@@ -59,6 +60,9 @@ pub struct WindowRead {
     pub document_ms: u128,
     /// Tijd in de boomwandeling.
     pub tree_ms: u128,
+    /// Staat er ergens in de boom een wachtwoordveld? Dan mag niets van dit
+    /// venster bewaard worden.
+    pub password_field: bool,
 }
 
 impl WindowRead {
@@ -86,6 +90,7 @@ impl UiaReader {
             cache.AddProperty(UIA_NamePropertyId)?;
             cache.AddProperty(UIA_ControlTypePropertyId)?;
             cache.AddProperty(UIA_IsOffscreenPropertyId)?;
+            cache.AddProperty(UIA_IsPasswordPropertyId)?;
             cache.AddPattern(UIA_ValuePatternId)?;
             cache.SetTreeScope(TreeScope_Subtree)?;
             cache.SetTreeFilter(&content_view)?;
@@ -134,11 +139,24 @@ impl UiaReader {
                 .context("accessibility-boom uitlezen mislukt")?;
 
         let elements = unsafe { found.Length() }.unwrap_or(0);
-        for i in 0..elements.min(self.max_elements) {
+        let mut password_field = false;
+        // Wachtwoordvelden zoeken we in álle knopen, ook voorbij `max_elements`
+        // en ook buiten beeld: een veld dat nu weggescrolld is kan straks weer
+        // in beeld komen, en veiligheid hoort niet van zichtbaarheid af te hangen.
+        for i in 0..elements {
             let Ok(element) = (unsafe { found.GetElement(i) }) else {
                 continue;
             };
-            self.collect(&element, &mut lines);
+            if unsafe { element.CachedIsPassword() }
+                .map(|b| b.as_bool())
+                .unwrap_or(false)
+            {
+                password_field = true;
+                break;
+            }
+            if i < self.max_elements {
+                self.collect(&element, &mut lines);
+            }
         }
         let tree_ms = started.elapsed().as_millis();
 
@@ -148,6 +166,7 @@ impl UiaReader {
             document_text,
             document_ms,
             tree_ms,
+            password_field,
         })
     }
 
