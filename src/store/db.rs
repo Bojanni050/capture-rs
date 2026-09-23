@@ -257,7 +257,7 @@ impl Db {
     }
 
     /// v4: uitsluitingen (per app, venster of domein; sticky tot je ze zelf
-    /// verwijdert) en de cursor van de Stash-shipper.
+    /// verwijdert) en de cursor van de Foundation-shipper.
     ///
     /// De cursor-rij ontbreekt bewust tot de shipper voor het eerst draait: hij
     /// begint dan bij de nieuwste capture in plaats van de hele historie naar

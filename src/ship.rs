@@ -300,4 +300,41 @@ mod tests {
         assert_eq!(ship_once(&client, &cfg, None, &db).await.unwrap(), 0);
         assert_eq!(received.bodies.lock().unwrap().len(), 1);
     }
+
+    /// Foundation's Ingestie Gateway hanteert een **exact** veldcontract
+    /// (`server/ingestPolicy.js`): onbekende velden en server-eigendommen als
+    /// `status` leveren er een 422 op. Deze test legt vast wat wij sturen,
+    /// zodat een wijziging hier hard faalt in plaats van pas bij Foundation.
+    #[test]
+    fn payload_voldoet_aan_het_contract_van_foundation() {
+        let row = CaptureRow {
+            id: 42,
+            ts: 1_000,
+            app: "outlook".into(),
+            title: "Inbox".into(),
+            source: "outlook.exe".into(),
+            has_frame: false,
+            index_text: "tekst".into(),
+        };
+
+        let payload = to_payload(&row);
+        let obj = payload.as_object().expect("payload is een JSON-object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+
+        // Toegestaan voor de capture-entry-point — en géén veld meer.
+        assert_eq!(keys, ["content", "occurredAt", "source", "tags", "title", "url"]);
+        // Verplicht: content én source.
+        assert_eq!(payload["content"], "tekst");
+        assert_eq!(payload["source"], "capture-rs");
+        // occurredAt moet ISO 8601 zijn; Foundation faalt er anders op.
+        assert!(
+            payload["occurredAt"]
+                .as_str()
+                .unwrap()
+                .parse::<DateTime<Utc>>()
+                .is_ok(),
+            "occurredAt is geen geldig ISO 8601-tijdstip"
+        );
+    }
 }

@@ -631,7 +631,7 @@ fn cmd_doctor(cfg: Config, cfg_path: &std::path::Path) -> Result<()> {
         }
     );
     println!(
-        "Stash-shipping   {}",
+        "Foundation       {}",
         if cfg.ship.enabled {
             format!(
                 "aan → {} (token: {})",

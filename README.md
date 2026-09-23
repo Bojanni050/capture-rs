@@ -279,9 +279,9 @@ port = 8765                # zie browser-extension/README.md
 max_age_secs = 15.0        # oudere meldingen vertrouwen we niet
 
 [ship]
-enabled = false            # true = gefilterde tekst naar je Stash sturen
-endpoint = "http://100.64.144.93:8080/ingest"
-interval_secs = 300.0      # token: env STASH_AUTH_TOKEN of auth_token = "..."
+enabled = false            # true = gefilterde tekst naar Foundation sturen
+endpoint = "http://100.65.0.15:4577/api/ingest/capture"
+interval_secs = 300.0      # token: env CAPTURE_INGEST_TOKEN of auth_token = "..."
 
 [storage]
 keep_frames = "fallback"   # "always" | "fallback" | "never"
@@ -330,32 +330,35 @@ src/
   embeddings/ semantische laag (experimenteel, uit by default — zie hieronder)
   server/     axum: JSON-API en de ingebouwde webpagina
   browser.rs  bridge naar de browserextensie (alleen extensies, alleen 127.0.0.1)
-  ship.rs     optionele shipper naar Stash, met cursor in SQLite
+  ship.rs     optionele shipper naar Foundation, met cursor in SQLite
   pipeline.rs de opnamelus die alles aan elkaar knoopt
 browser-extension/  MV3-extensie: domein + wachtwoordveld van het actieve tabblad
-deploy/
-  stash-ingest/    ruwe buffer op je VPS (Flask + SQLite, alleen Tailscale)
-  selection-pass/  LLM-relevantiefilter: Stash -> Hindsight
 ```
 
-## Stash en Hindsight (optioneel)
+## Foundation (optioneel)
 
-Standaard blijft alles op deze machine. Wil je ook een curatiestraat, zet dan
-`[ship] enabled = true`. Capture stuurt elke 5 minuten de nieuwe
-`index_text` (dus zonder terugkerende menubalken en zonder gevoelige patronen)
-als NDJSON naar `deploy/stash-ingest`; `deploy/selection-pass` bundelt dat op
-je VPS tot episodes, laat een LLM beslissen wat het onthouden waard is en
-bewaart de rest in Hindsight. Installatie van beide staat in hun eigen README.
+Standaard blijft alles op deze machine. Wil je dat captures ook buiten deze
+machine beschikbaar komen, zet dan `[ship] enabled = true`. Capture stuurt dan
+elke 5 minuten de nieuwe `index_text` (dus zonder terugkerende menubalken en
+zonder gevoelige patronen) als één JSON-object per capture naar de
+**Ingestie Gateway van Foundation** — `POST /api/ingest/capture`, zie
+[Bojanni050/Foundation](https://github.com/Bojanni050/Foundation), het geheugen
+met één API. Foundation schrijft alles binnen als `observation`; het
+ruisfilteren gebeurt hier, aan de capture-kant. Het exacte veldcontract staat
+in [`docs/foundation-gateway.md`](docs/foundation-gateway.md).
 
 - De **eerste keer** begint de shipper bij de nieuwste capture, niet bij de
   hele historie.
-- Een cursor in SQLite schuift pas op nadat Stash de batch met 2xx bevestigde;
-  bij een storing wordt dezelfde batch de volgende ronde opnieuw verstuurd.
-- Alleen `http://`: het is bedoeld voor Tailscale. Het token komt uit de
-  omgevingsvariabele `STASH_AUTH_TOKEN` (of `ship.auth_token`).
-- Stash dedupliceert op (tijdstip, app, venstertitel); bij `monitor = "all"`
-  kunnen twee schermen met dezelfde titel binnen dezelfde seconde dus één rij
-  worden.
+- Een cursor in SQLite schuift pas op nadat Foundation de POST met 2xx
+  bevestigde; bij een storing gaat dezelfde batch de volgende ronde opnieuw.
+- Dedup op de capture-url (`capture://capture/<id>`): Foundation updatet een
+  bestaande rij in plaats van hem te verdubbelen.
+- Endpoint staat standaard op `http://100.65.0.15:4577/api/ingest/capture`
+  (Tailscale, geen TLS). Het token komt uit `CAPTURE_INGEST_TOKEN` of
+  `ship.auth_token` en staat op de VPS in `server/data/token.txt`.
+- Foundation is streng: onbekende of verboden velden leveren een 422 op
+  (`status` en `providerConversationId` zijn server-eigendom). Daarom stuurt
+  de shipper alleen de toegestane velden.
 
 ## Semantisch zoeken (experimenteel)
 
@@ -381,8 +384,8 @@ het aanzet.
 Standaard blijft alles lokaal: SQLite en JPEG's onder
 `%LOCALAPPDATA%\Capture\data`. Er gaat niets naar buiten en er zit geen
 telemetrie in. De enige uitzondering is de shipper (`[ship] enabled = true`),
-die uit staat tot jij hem aanzet en dan alleen gefilterde tekst naar jouw eigen
-Stash stuurt.
+die uit staat tot jij hem aanzet en dan alleen gefilterde tekst naar Foundation
+stuurt.
 
 Wat je zelf moet weten: dit legt vast wat er op je scherm staat. De denylist en
 de redactie vangen de voor de hand liggende gevallen af, maar niet alles.
