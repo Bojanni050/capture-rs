@@ -1,44 +1,52 @@
-//! Stuurt gefilterde tekst naar een Stash-ingest op je VPS (`deploy/stash-ingest`).
+//! Stuurt gefilterde tekst naar de Foundation Ingestie Gateway op je VPS
+//! (POST /api/ingest/capture, zie docs/foundation-gateway.md).
 //!
-//! Achter de shipper zit de curatiestraat: Stash (ruwe buffer) → selection-pass
-//! (LLM-relevantiefilter) → Hindsight. Chronicle levert alleen `index_text`:
-//! de tekst zonder terugkerende menubalken en zonder gevoelige patronen, dus
-//! de LLM betaalt niet voor chrome.
+//! Elke capture met tekst gaat als eigen JSON-object naar de Gateway; de
+//! Gateway bepaalt status ("observation") en slaat hem op in Postgres. De
+//! identiteit van een capture ligt in url = chronicle://capture/<id>, dus
+//! een dubbel-verzonden capture wordt door Foundation ge-updated in plaats
+//! van verdubbeld.
 //!
-//! Betrouwbaarheid komt van een cursor in SQLite (`ship_cursor`), niet van
-//! bestandjes: de cursor schuift pas op nadat Stash het gehele blok met 2xx
-//! bevestigde. Mislukt een post, dan gaat dezelfde batch de volgende ronde
-//! opnieuw; Stash dedupliceert op (ts, app, window_title), dus een
-//! dubbel-verzonden batch levert geen dubbele rijen op.
+//! Betrouwbaarheid komt van een cursor in SQLite (ship_cursor), niet van
+//! bestandjes: de cursor schuift pas op nadat de Gateway de hele batch met
+//! 2xx bevestigde. Mislukt een post, dan gaat dezelfde batch de volgende
+//! ronde opnieuw; door de url-dedup levert dat geen dubbele rijen op.
 //!
-//! De eerste keer dat de shipper draait begint hij bij de nieuwste capture, niet
-//! bij de hele historie.
+//! Captures zonder tekst (alleen beeld) worden overgeslagen; de cursor
+//! schuift wel over ze heen zodat ze niet blijven blokkeren.
+//!
+//! De eerste keer dat de shipper draait begint hij bij de nieuwste capture,
+//! niet bij de hele historie.
 
 use crate::config::ShipConfig;
 use crate::embeddings::CaptureRow;
 use crate::store::Db;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-/// Zo groot is een batch uit `Db::fetch_captures_since`.
+/// Zo groot is een batch uit Db::fetch_captures_since.
 const DB_BATCH: usize = 500;
 
-fn to_ndjson(rows: &[CaptureRow]) -> String {
-    rows.iter()
-        .map(|r| {
-            json!({
-                "ts": r.ts as f64,
-                "app": r.app,
-                "window_title": r.title,
-                "text": r.index_text,
-            })
-            .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn rfc3339(ts: i64) -> String {
+    DateTime::from_timestamp(ts, 0)
+        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).expect("epoch is geldig"))
+        .to_rfc3339()
+}
+
+/// JSON-payload voor een capture voor de Foundation Gateway.
+fn to_payload(row: &CaptureRow) -> serde_json::Value {
+    json!({
+        "content": row.index_text,
+        "source": "chronicle-rs",
+        "title": format!("{} — {}", row.app, row.title),
+        "url": format!("chronicle://capture/{}", row.id),
+        "tags": [row.app],
+        "occurredAt": rfc3339(row.ts),
+    })
 }
 
 /// Verstuurt alles wat sinds de cursor is bijgekomen. Geeft het aantal
@@ -73,23 +81,28 @@ async fn ship_once(
         };
         let last_id = last.id;
 
-        let mut request = client
-            .post(&cfg.endpoint)
-            .header("Content-Type", "application/x-ndjson")
-            .body(to_ndjson(&rows));
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
+        // Per capture een eigen POST; mislukt er een, dan blijft de cursor
+        // staan en gaat de hele batch de volgende ronde opnieuw (idempotent
+        // via de url).
+        for row in rows.iter().filter(|r| !r.index_text.trim().is_empty()) {
+            let mut request = client
+                .post(&cfg.endpoint)
+                .header("Content-Type", "application/json")
+                .body(to_payload(row).to_string());
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            request
+                .send()
+                .await
+                .context("Foundation Gateway onbereikbaar")?
+                .error_for_status()
+                .context("Foundation Gateway weigerde de capture")?;
+            shipped += 1;
         }
-        request
-            .send()
-            .await
-            .context("Stash onbereikbaar")?
-            .error_for_status()
-            .context("Stash weigerde de batch")?;
 
         db.save_ship_cursor(last_id)?;
         cursor = last_id;
-        shipped += rows.len();
 
         if rows.len() < DB_BATCH {
             return Ok(shipped);
@@ -110,7 +123,7 @@ pub async fn run(cfg: ShipConfig, db: Arc<Db>, mut shutdown: watch::Receiver<boo
     };
     let token = cfg.resolved_token();
     if token.is_none() {
-        tracing::warn!("geen STASH_AUTH_TOKEN of ship.auth_token: Stash accepteert dit alleen zonder INGEST_TOKEN");
+        tracing::warn!("geen CHRONICLE_INGEST_TOKEN of ship.auth_token: Foundation Gateway weigert zonder Bearer-token");
     }
     tracing::info!(endpoint = cfg.endpoint, "shipper actief");
 
@@ -118,7 +131,7 @@ pub async fn run(cfg: ShipConfig, db: Arc<Db>, mut shutdown: watch::Receiver<boo
     loop {
         match ship_once(&client, &cfg, token.as_deref(), &db).await {
             Ok(0) => {}
-            Ok(n) => tracing::info!(captures = n, "naar Stash verzonden"),
+            Ok(n) => tracing::info!(captures = n, "naar Foundation Gateway verzonden"),
             // Nooit fataal: de opname loopt door en de cursor bewaart de achterstand.
             Err(e) => tracing::warn!(error = format!("{e:#}"), "shippen mislukt; volgende ronde opnieuw"),
         }
@@ -146,16 +159,16 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct Received {
-        bodies: Arc<Mutex<Vec<String>>>,
+        bodies: Arc<Mutex<Vec<serde_json::Value>>>,
         auth: Arc<Mutex<Vec<String>>>,
         fail: Arc<Mutex<bool>>,
     }
 
     async fn ingest(State(rx): State<Received>, headers: HeaderMap, body: String) -> StatusCode {
         if *rx.fail.lock().unwrap() {
-            return StatusCode::INTERNAL_SERVER_ERROR;
+            return StatusCode::UNPROCESSABLE_ENTITY;
         }
-        rx.bodies.lock().unwrap().push(body);
+        rx.bodies.lock().unwrap().push(serde_json::from_str(&body).expect("geldig JSON"));
         rx.auth.lock().unwrap().push(
             headers
                 .get("authorization")
@@ -166,15 +179,15 @@ mod tests {
         StatusCode::OK
     }
 
-    async fn fake_stash() -> (String, Received) {
+    async fn fake_gateway() -> (String, Received) {
         let rx = Received::default();
-        let app = Router::new().route("/ingest", post(ingest)).with_state(rx.clone());
+        let app = Router::new().route("/api/ingest/capture", post(ingest)).with_state(rx.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (format!("http://{addr}/ingest"), rx)
+        (format!("http://{addr}/api/ingest/capture"), rx)
     }
 
     fn seed(db: &Db, ts: i64, app: &str, text: &str) -> i64 {
@@ -200,7 +213,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn eerste_keer_begint_bij_nu_daarna_alleen_nieuwe_captures() {
-        let (endpoint, received) = fake_stash().await;
+        let (endpoint, received) = fake_gateway().await;
         let cfg = ShipConfig {
             enabled: true,
             endpoint,
@@ -218,11 +231,12 @@ mod tests {
         {
             let bodies = received.bodies.lock().unwrap();
             assert_eq!(bodies.len(), 1);
-            let line: serde_json::Value = serde_json::from_str(bodies[0].trim()).unwrap();
-            assert_eq!(line["app"], "code");
-            assert_eq!(line["window_title"], "venster");
-            assert_eq!(line["text"], "nieuwe regel tekst");
-            assert_eq!(line["ts"], 2000.0);
+            assert_eq!(bodies[0]["content"], "nieuwe regel tekst");
+            assert_eq!(bodies[0]["source"], "chronicle-rs");
+            assert_eq!(bodies[0]["title"], "code — venster");
+            assert_eq!(bodies[0]["tags"][0], "code");
+            assert!(bodies[0]["url"].as_str().unwrap().starts_with("chronicle://capture/"));
+            assert!(bodies[0]["occurredAt"].as_str().unwrap().starts_with("1970-01-01"));
             assert_eq!(received.auth.lock().unwrap()[0], "Bearer geheim");
         }
 
@@ -233,7 +247,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn mislukte_post_laat_de_cursor_staan_en_probeert_opnieuw() {
-        let (endpoint, received) = fake_stash().await;
+        let (endpoint, received) = fake_gateway().await;
         let cfg = ShipConfig {
             enabled: true,
             endpoint,
@@ -244,7 +258,7 @@ mod tests {
 
         // Initialiseer de cursor voordat er nieuwe captures zijn.
         assert_eq!(ship_once(&client, &cfg, None, &db).await.unwrap(), 0);
-        seed(&db, 3_000, "code", "moet blijven liggen tot Stash terug is");
+        seed(&db, 3_000, "code", "moet blijven liggen tot de Gateway terug is");
 
         *received.fail.lock().unwrap() = true;
         assert!(ship_once(&client, &cfg, None, &db).await.is_err());
@@ -252,6 +266,38 @@ mod tests {
 
         *received.fail.lock().unwrap() = false;
         assert_eq!(ship_once(&client, &cfg, None, &db).await.unwrap(), 1);
+        assert_eq!(received.bodies.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lege_tekst_wordt_overgeslagen_maar_schuift_de_cursor_door() {
+        let (endpoint, received) = fake_gateway().await;
+        let cfg = ShipConfig {
+            enabled: true,
+            endpoint,
+            ..Default::default()
+        };
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let client = reqwest::Client::new();
+
+        // Cursor initialiseren.
+        assert_eq!(ship_once(&client, &cfg, None, &db).await.unwrap(), 0);
+        seed(&db, 4_000, "beeld", "   ");
+        let tekst_id = seed(&db, 4_100, "code", "wel tekst");
+        seed(&db, 4_200, "beeld", "");
+
+        // Alleen de capture met tekst gaat erheen, maar de cursor schuift
+        // door tot de laatste (lege) capture.
+        assert_eq!(ship_once(&client, &cfg, None, &db).await.unwrap(), 1);
+        {
+            let bodies = received.bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 1);
+            assert_eq!(bodies[0]["content"], "wel tekst");
+            assert_eq!(bodies[0]["url"], format!("chronicle://capture/{tekst_id}"));
+        }
+
+        // Tweede ronde: niets meer te doen, ook de lege niet opnieuw.
+        assert_eq!(ship_once(&client, &cfg, None, &db).await.unwrap(), 0);
         assert_eq!(received.bodies.lock().unwrap().len(), 1);
     }
 }

@@ -54,11 +54,13 @@ impl Default for BrowserConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShipConfig {
-    /// Stuur gefilterde tekst naar een Stash-ingest (VPS). Standaard uit:
-    /// zonder dit blijft alles op deze machine.
+    /// Stuur gefilterde tekst naar de Foundation Ingestie Gateway (VPS),
+    /// zie docs/foundation-gateway.md. Standaard uit: zonder dit blijft
+    /// alles op deze machine.
     pub enabled: bool,
     pub endpoint: String,
-    /// Bearer-token; leeg = uit de omgevingsvariabele `STASH_AUTH_TOKEN`.
+    /// Bearer-token; leeg = uit de omgevingsvariabele `CHRONICLE_INGEST_TOKEN`
+    /// (legacy: `STASH_AUTH_TOKEN`).
     pub auth_token: Option<String>,
     pub interval_secs: f64,
 }
@@ -67,7 +69,7 @@ impl Default for ShipConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            endpoint: "http://100.64.144.93:8080/ingest".into(),
+            endpoint: "http://100.65.0.15:4577/api/ingest/capture".into(),
             auth_token: None,
             interval_secs: 300.0,
         }
@@ -79,6 +81,11 @@ impl ShipConfig {
         self.auth_token
             .clone()
             .filter(|t| !t.trim().is_empty())
+            .or_else(|| {
+                std::env::var("CHRONICLE_INGEST_TOKEN")
+                    .ok()
+                    .filter(|t| !t.trim().is_empty())
+            })
             .or_else(|| std::env::var("STASH_AUTH_TOKEN").ok().filter(|t| !t.trim().is_empty()))
     }
 }
