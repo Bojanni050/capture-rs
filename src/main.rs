@@ -1,4 +1,4 @@
-//! Chronicle — houdt bij wat je op je pc doet, met een ruisfilter ervoor.
+//! Capture — houdt bij wat je op je pc doet, met een ruisfilter ervoor.
 //!
 //! Zie `README.md` voor de opzet; de opnamelus zelf staat in `pipeline.rs` en
 //! het filter in `filter/mod.rs`.
@@ -30,7 +30,7 @@ use store::{Db, FrameStore, SearchQuery};
 
 #[derive(Parser)]
 #[command(
-    name = "chronicle",
+    name = "capture",
     version,
     about = "Legt vast wat je op je pc doet: tekst via de accessibility-boom, \
              dan OCR, met beeld als laatste vangnet."
@@ -130,7 +130,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ExcludeCommand {
-    /// Toon alles wat is uitgesloten, ook wat Chronicle zelf leerde.
+    /// Toon alles wat is uitgesloten, ook wat Capture zelf leerde.
     List,
     /// Sluit iets uit: een app (`slack`), een domein (`mijnbank.nl`) of een venster (`app::titel`).
     Add {
@@ -138,7 +138,7 @@ enum ExcludeCommand {
         kind: String,
         key: String,
     },
-    /// Haal een uitsluiting weg. Chronicle doet dit nooit zelf: uitsluiten is sticky.
+    /// Haal een uitsluiting weg. Capture doet dit nooit zelf: uitsluiten is sticky.
     Remove {
         #[arg(value_parser = ["app", "domain", "window"])]
         kind: String,
@@ -194,6 +194,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     init_logging(cli.verbose);
+
+    // Eenmalig: oude `Chronicle`-opstartregistratie omzetten naar `Capture`.
+    autostart::migrate_legacy();
 
     let (cfg, cfg_path) = Config::load(cli.config.as_deref())?;
 
@@ -617,7 +620,7 @@ fn cmd_doctor(cfg: Config, cfg_path: &std::path::Path) -> Result<()> {
     let excluded = Db::open(&db_path).and_then(|db| db.list_excluded()).map(|l| l.len());
     println!(
         "Uitsluitingen    {}",
-        excluded.map_or_else(|e| format!("!! {e}"), |n| format!("{n} (zie `chronicle exclude list`)"))
+        excluded.map_or_else(|e| format!("!! {e}"), |n| format!("{n} (zie `capture exclude list`)"))
     );
     println!(
         "Browser-bridge   {}",
@@ -772,7 +775,7 @@ fn cmd_config(cfg: Config, path: &std::path::Path, init: bool) -> Result<()> {
 
     println!("# {}", path.display());
     if !path.exists() {
-        println!("# (bestaat nog niet — dit zijn de defaults; `chronicle config --init` schrijft ze weg)");
+        println!("# (bestaat nog niet — dit zijn de defaults; `capture config --init` schrijft ze weg)");
     }
     println!("{}", toml::to_string_pretty(&cfg)?);
     Ok(())
@@ -817,7 +820,7 @@ fn cmd_autostart(action: AutostartCommand) -> Result<()> {
     match action {
         AutostartCommand::Enable => {
             autostart::enable()?;
-            println!("Chronicle start voortaan automatisch op bij het inloggen (met systemtray-icoon).");
+            println!("Capture start voortaan automatisch op bij het inloggen (met systemtray-icoon).");
         }
         AutostartCommand::Disable => {
             autostart::disable()?;

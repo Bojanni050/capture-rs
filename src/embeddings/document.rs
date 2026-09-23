@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn groepeert_binnen_window() {
         let caps = vec![
-            cap(1, 1000, "code", "working on chronicle uia pipeline"),
+            cap(1, 1000, "code", "working on capture uia pipeline"),
             cap(2, 1005, "code", "investigating semantic embeddings architecture"),
             cap(3, 1200, "code", "another app later but same window"),
         ];

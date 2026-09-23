@@ -1,11 +1,11 @@
-# Chronicle
+# Capture
 
 Houdt bij wat je op je pc doet — in Rust, lokaal, zonder cloud. Geïnspireerd op
 [screenpipe](https://github.com/screenpipe/screenpipe), maar toegespitst op
 Windows en met een ruisfilter dat serieus werk doet in plaats van alles te
 bewaren.
 
-Bij een wissel van voorgrondvenster reageert Chronicle direct (na een korte
+Bij een wissel van voorgrondvenster reageert Capture direct (na een korte
 debounce); daarnaast blijft er een periodieke controle als vangnet voor video,
 canvas-apps en andere inhoud zonder Windows-events. Daarna leest het de tekst
 uit, filtert ruis en slaat het resultaat doorzoekbaar op. Dat uitlezen gebeurt
@@ -22,7 +22,7 @@ via drie bronnen, in volgorde van betrouwbaarheid:
 ## Wat het oplevert
 
 ```
-$ chronicle search "kwartaalrapportage" --since 7d
+$ capture search "kwartaalrapportage" --since 7d
 
 12-08 14:22  outlook  [tekst]  RE: Kwartaalcijfers Q3 - Outlook
   ...de «kwartaalrapportage» moet uiterlijk vrijdag bij finance liggen...
@@ -54,7 +54,7 @@ menubalk — niet je werk. Die regels blijven wél in de bewaarde tekst staan
 (zodat je een scherm compleet kunt terugkijken), maar gaan níét de zoekindex in.
 Dat geheugen overleeft een herstart.
 
-Wat het filter heeft weggegooid en waarom, zie je terug in `chronicle stats`.
+Wat het filter heeft weggegooid en waarom, zie je terug in `capture stats`.
 
 ## De accessibility-laag
 
@@ -64,7 +64,7 @@ plaats van een gok op basis van pixels — geen `l` die een `1` wordt, geen
 `socket` die `socker` wordt.
 
 De valkuil is het aantal COM-aanroepen. Knoop-voor-knoop door de boom lopen kost
-één cross-process call per property, en dan ben je trager dan OCR. Chronicle
+één cross-process call per property, en dan ben je trager dan OCR. Capture
 haalt daarom de hele deelboom in **één** `FindAllBuildCache` op, met de
 properties vooraf gedeclareerd, en leest daarna alleen nog uit de cache. De
 wandeling gebruikt de *content view*, niet de raw view: dat laat elk decoratief
@@ -96,10 +96,10 @@ Drie dingen om te weten:
   op een eigen thread met een deadline; loopt die af, dan gaat OCR verder en
   slaat de volgende tik UIA over zolang de thread nog bezet is.
 - **Niet elke app doet mee.** PowerShell en sommige Electron-apps geven een lege
-  boom. Chronicle onthoudt dat per app en zet UIA daar tijdelijk uit, zodat je
+  boom. Capture onthoudt dat per app en zet UIA daar tijdelijk uit, zodat je
   niet elke tik opnieuw voor niets wacht.
 
-`chronicle doctor` probeert UIA op al je open vensters en zegt per app of het
+`capture doctor` probeert UIA op al je open vensters en zegt per app of het
 werkt — de snelste manier om te zien wat jouw mix oplevert.
 
 ## De image-fallback
@@ -121,7 +121,7 @@ ziet de reden terug in de webinterface bij elk beeld-item.
 
 ## Wachtwoordvelden en de uitsluitingslijst
 
-Twee signalen leren Chronicle wat het nooit mag vastleggen, zonder dat jij een
+Twee signalen leren Capture wat het nooit mag vastleggen, zonder dat jij een
 lijst met banken bijhoudt:
 
 - **UIA `IsPassword`** — staat er ergens in de accessibility-boom van het
@@ -143,10 +143,10 @@ weghaalt. Een dashboard dat na het inloggen geen wachtwoordveld meer toont mag
 niet stilletjes weer meedoen.
 
 ```bash
-chronicle exclude list
-chronicle exclude add domain mijnbank.nl
-chronicle exclude add app slack
-chronicle exclude remove domain github.com   # bv. als het te grof bleek
+capture exclude list
+capture exclude add domain mijnbank.nl
+capture exclude add app slack
+capture exclude remove domain github.com   # bv. als het te grof bleek
 ```
 
 Beperking: bij `monitor = "all"` staat UIA uit (zie hieronder), dus dan is er
@@ -160,7 +160,7 @@ gemaximaliseerd venster nog zichtbaar is — een ander tabblad, een chatvenster
 op de achtergrond, een sidebar. Zonder maatregel zou dat allemaal door OCR
 gehaald en aan de verkeerde app toegeschreven worden.
 
-Daarom snijdt Chronicle elke screenshot vóór OCR (en vóór een eventueel bewaard
+Daarom snijdt Capture elke screenshot vóór OCR (en vóór een eventueel bewaard
 beeld) bij tot het zichtbare rechthoek van het voorgrondvenster
 (`DwmGetWindowAttribute`/`DWMWA_EXTENDED_FRAME_BOUNDS`, met `GetWindowRect` als
 terugval). Dat rechthoek wordt vlak vóór de screenshot opgevraagd, en er komt
@@ -176,7 +176,7 @@ een ander venster kan daar nooit in lekken. De bijsnijding is dus vooral van
 belang voor de OCR-fallback, en voor de beeld-fallback wanneer die wordt
 opgeslagen.
 
-Dit vereist dat Chronicle per-monitor DPI-bewust is (`main.rs` zet dit bij het
+Dit vereist dat Capture per-monitor DPI-bewust is (`main.rs` zet dit bij het
 opstarten) — zonder dat geeft Windows geschaalde coördinaten terug die niet
 meer overeenkomen met de fysieke pixels van een screenshot, en zou het
 bijsnijden het verkeerde stuk scherm pakken.
@@ -184,37 +184,37 @@ bijsnijden het verkeerde stuk scherm pakken.
 ## Installatie
 
 Nodig: Rust (stable, msvc-toolchain), Windows 10/11, en minstens één taalpakket
-met OCR-ondersteuning (`chronicle doctor` vertelt je of dat er is).
+met OCR-ondersteuning (`capture doctor` vertelt je of dat er is).
 
 ```bash
 cargo build --release
 ```
 
-De binary staat in `target/release/chronicle.exe`.
+De binary staat in `target/release/capture.exe`.
 
 ## Gebruik
 
 ```bash
-chronicle doctor              # controleer uia per app, OCR, schermen, database
-chronicle start               # opnemen + webinterface op 127.0.0.1:7331
-chronicle start --tray        # hetzelfde, plus een systemtray-icoon
-chronicle start --no-server   # alleen opnemen
-chronicle serve               # alleen de webinterface
+capture doctor              # controleer uia per app, OCR, schermen, database
+capture start               # opnemen + webinterface op 127.0.0.1:7331
+capture start --tray        # hetzelfde, plus een systemtray-icoon
+capture start --no-server   # alleen opnemen
+capture serve               # alleen de webinterface
 
-chronicle search "factuur" --since 30d --app outlook
-chronicle search "" --since 2h --kind image   # wat is er beeld geworden?
-chronicle stats --since 7d
-chronicle purge --older-than 60d --yes
-chronicle config --init       # schrijf alle instellingen naar een bestand
+capture search "factuur" --since 30d --app outlook
+capture search "" --since 2h --kind image   # wat is er beeld geworden?
+capture stats --since 7d
+capture purge --older-than 60d --yes
+capture config --init       # schrijf alle instellingen naar een bestand
 
-chronicle autostart enable    # start automatisch op bij het inloggen (met tray-icoon)
-chronicle autostart disable
-chronicle autostart status
+capture autostart enable    # start automatisch op bij het inloggen (met tray-icoon)
+capture autostart disable
+capture autostart status
 ```
 
 ## Systemtray-icoon en automatisch opstarten
 
-`chronicle start --tray` toont een stip in de systemtray die de status van de
+`capture start --tray` toont een stip in de systemtray die de status van de
 opname laat zien:
 
 | Kleur | Betekent |
@@ -224,19 +224,19 @@ opname laat zien:
 | 🔴 rood | de laatste tik mislukte |
 
 Rechtsklik erop voor het dashboard, een vinkje voor automatisch opstarten en
-"Chronicle afsluiten". Dubbelklikken opent meteen het dashboard.
+"Capture afsluiten". Dubbelklikken opent meteen het dashboard.
 
 Voor automatisch opstarten bij het inloggen, zonder het icoon zelf elke keer
 aan te hoeven zetten:
 
 ```bash
-chronicle autostart enable
+capture autostart enable
 ```
 
-Dit zet `chronicle.exe start --tray` in de `Run`-sleutel van je eigen
+Dit zet `capture.exe start --tray` in de `Run`-sleutel van je eigen
 Windows-account (`HKCU\...\Run`) — geen adminrechten nodig, en het start pas
-ná inloggen (dus met je bureaublad en schermen al actief). `chronicle
-autostart disable` zet het weer uit; `chronicle autostart status` laat zien
+ná inloggen (dus met je bureaublad en schermen al actief). `capture
+autostart disable` zet het weer uit; `capture autostart status` laat zien
 wat er nu staat.
 
 `doctor` probeert UIA op al je open vensters én doet een echte OCR-proefopname,
@@ -244,8 +244,8 @@ met tijden erbij — de snelste manier om je drempels te ijken.
 
 ## Configuratie
 
-`chronicle config --init` schrijft alle defaults naar
-`%LOCALAPPDATA%\ChronicleCapture\chronicle.toml`. De knoppen die er het meest
+`capture config --init` schrijft alle defaults naar
+`%LOCALAPPDATA%\Capture\capture.toml`. De knoppen die er het meest
 toe doen:
 
 ```toml
@@ -289,7 +289,7 @@ retention_days = 45        # alles ouder dan dit verdwijnt
 frame_retention_days = 10  # afbeeldingen eerder, tekst blijft langer
 ```
 
-Bij `monitor = "all"` behandelt Chronicle elk scherm als een eigen bron: elk
+Bij `monitor = "all"` behandelt Capture elk scherm als een eigen bron: elk
 frame krijgt eerst zijn eigen beeldhash en tekstvergelijking. UI Automation
 beschrijft alleen het voorgrondvenster en wordt daarom alleen gebruikt wanneer
 één monitor is geselecteerd; bij een multischerm-opname leest OCR de schermen
@@ -341,7 +341,7 @@ deploy/
 ## Stash en Hindsight (optioneel)
 
 Standaard blijft alles op deze machine. Wil je ook een curatiestraat, zet dan
-`[ship] enabled = true`. Chronicle stuurt elke 5 minuten de nieuwe
+`[ship] enabled = true`. Capture stuurt elke 5 minuten de nieuwe
 `index_text` (dus zonder terugkerende menubalken en zonder gevoelige patronen)
 als NDJSON naar `deploy/stash-ingest`; `deploy/selection-pass` bundelt dat op
 je VPS tot episodes, laat een LLM beslissen wat het onthouden waard is en
@@ -361,16 +361,16 @@ bewaart de rest in Hindsight. Installatie van beide staat in hun eigen README.
 
 Naast FTS5 zit er een `[embeddings]`-sectie in de config (`enabled = false`
 standaard) die captures groepeert, embedt en in pgvector opslaat voor
-`chronicle search --semantic`. Met `provider = "fastembed"` gebruikt dat een
+`capture search --semantic`. Met `provider = "fastembed"` gebruikt dat een
 echt lokaal model (`intfloat/multilingual-e5-small`, ONNX Runtime, CPU,
 NL+EN) — geen cloud-aanroep, wel een eenmalige download van ~118 MB bij een
 lege modelcache. De default blijft `provider = "mock"`, dus `enabled = true`
 alleen triggert nooit ongevraagd die download.
 
 Dit is nog geen afgeronde feature: zonder een draaiende Postgres/pgvector
-deelt geen enkele losse CLI-aanroep (`chronicle search --semantic`,
-`chronicle embeddings status/rebuild`) zijn data met een lopend
-`chronicle start`-proces — alleen de ingebouwde webinterface van dat proces
+deelt geen enkele losse CLI-aanroep (`capture search --semantic`,
+`capture embeddings status/rebuild`) zijn data met een lopend
+`capture start`-proces — alleen de ingebouwde webinterface van dat proces
 zelf ziet wat er geïndexeerd is. Zie
 [`docs/embeddings-proposal.md`](docs/embeddings-proposal.md) voor de
 volledige architectuur en een expliciete lijst bekende beperkingen voordat je
@@ -379,7 +379,7 @@ het aanzet.
 ## Privacy
 
 Standaard blijft alles lokaal: SQLite en JPEG's onder
-`%LOCALAPPDATA%\ChronicleCapture\data`. Er gaat niets naar buiten en er zit geen
+`%LOCALAPPDATA%\Capture\data`. Er gaat niets naar buiten en er zit geen
 telemetrie in. De enige uitzondering is de shipper (`[ship] enabled = true`),
 die uit staat tot jij hem aanzet en dan alleen gefilterde tekst naar jouw eigen
 Stash stuurt.
@@ -387,4 +387,4 @@ Stash stuurt.
 Wat je zelf moet weten: dit legt vast wat er op je scherm staat. De denylist en
 de redactie vangen de voor de hand liggende gevallen af, maar niet alles.
 Controleer `app_denylist` voordat je dit langere tijd laat draaien, en gebruik
-`chronicle purge` als je iets kwijt wilt.
+`capture purge` als je iets kwijt wilt.

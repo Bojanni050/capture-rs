@@ -30,7 +30,7 @@ pub fn make_store(cfg: &Config) -> Arc<dyn VectorStore> {
 /// op de tokio-runtime te draaien. Faalt het laden (geen internet bij de
 /// eerste run, ONNX-runtime probleem), dan valt dit terug op `MockProvider`
 /// met een duidelijke waarschuwing in plaats van capture te blokkeren of
-/// `chronicle start` te laten crashen op een optionele feature.
+/// `capture start` te laten crashen op een optionele feature.
 pub async fn make_provider(cfg: &Config) -> Arc<dyn EmbeddingProvider> {
     if cfg.embeddings.provider == "fastembed" {
         let cache_dir = cfg.models_dir();

@@ -87,7 +87,7 @@ impl UiaService {
         let max_elements = cfg.max_elements;
 
         std::thread::Builder::new()
-            .name("chronicle-uia".into())
+            .name("capture-uia".into())
             .spawn(move || {
                 let reader = match UiaReader::new(max_elements) {
                     Ok(reader) => {

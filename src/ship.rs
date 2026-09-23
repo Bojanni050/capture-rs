@@ -3,7 +3,7 @@
 //!
 //! Elke capture met tekst gaat als eigen JSON-object naar de Gateway; de
 //! Gateway bepaalt status ("observation") en slaat hem op in Postgres. De
-//! identiteit van een capture ligt in url = chronicle://capture/<id>, dus
+//! identiteit van een capture ligt in url = capture://capture/<id>, dus
 //! een dubbel-verzonden capture wordt door Foundation ge-updated in plaats
 //! van verdubbeld.
 //!
@@ -41,9 +41,9 @@ fn rfc3339(ts: i64) -> String {
 fn to_payload(row: &CaptureRow) -> serde_json::Value {
     json!({
         "content": row.index_text,
-        "source": "chronicle-rs",
+        "source": "capture-rs",
         "title": format!("{} — {}", row.app, row.title),
-        "url": format!("chronicle://capture/{}", row.id),
+        "url": format!("capture://capture/{}", row.id),
         "tags": [row.app],
         "occurredAt": rfc3339(row.ts),
     })
@@ -123,7 +123,7 @@ pub async fn run(cfg: ShipConfig, db: Arc<Db>, mut shutdown: watch::Receiver<boo
     };
     let token = cfg.resolved_token();
     if token.is_none() {
-        tracing::warn!("geen CHRONICLE_INGEST_TOKEN of ship.auth_token: Foundation Gateway weigert zonder Bearer-token");
+        tracing::warn!("geen CAPTURE_INGEST_TOKEN of ship.auth_token: Foundation Gateway weigert zonder Bearer-token");
     }
     tracing::info!(endpoint = cfg.endpoint, "shipper actief");
 
@@ -232,10 +232,10 @@ mod tests {
             let bodies = received.bodies.lock().unwrap();
             assert_eq!(bodies.len(), 1);
             assert_eq!(bodies[0]["content"], "nieuwe regel tekst");
-            assert_eq!(bodies[0]["source"], "chronicle-rs");
+            assert_eq!(bodies[0]["source"], "capture-rs");
             assert_eq!(bodies[0]["title"], "code — venster");
             assert_eq!(bodies[0]["tags"][0], "code");
-            assert!(bodies[0]["url"].as_str().unwrap().starts_with("chronicle://capture/"));
+            assert!(bodies[0]["url"].as_str().unwrap().starts_with("capture://capture/"));
             assert!(bodies[0]["occurredAt"].as_str().unwrap().starts_with("1970-01-01"));
             assert_eq!(received.auth.lock().unwrap()[0], "Bearer geheim");
         }
@@ -293,7 +293,7 @@ mod tests {
             let bodies = received.bodies.lock().unwrap();
             assert_eq!(bodies.len(), 1);
             assert_eq!(bodies[0]["content"], "wel tekst");
-            assert_eq!(bodies[0]["url"], format!("chronicle://capture/{tekst_id}"));
+            assert_eq!(bodies[0]["url"], format!("capture://capture/{tekst_id}"));
         }
 
         // Tweede ronde: niets meer te doen, ook de lege niet opnieuw.

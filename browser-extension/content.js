@@ -1,5 +1,5 @@
 // Draait op elke pagina. Meldt hostnaam + aanwezigheid van een wachtwoordveld
-// aan de background service worker, die het naar de lokale Chronicle-opname
+// aan de background service worker, die het naar de lokale Capture-opname
 // doorstuurt. Gedebounced en gededupliceerd zodat een drukke pagina niet bij
 // elke DOM-mutatie de bridge bestookt.
 (function () {
@@ -13,7 +13,7 @@
 
   function state() {
     return {
-      type: "chronicle-status",
+      type: "capture-status",
       hostname: location.hostname,
       hasPasswordField: hasPasswordField(),
       focused: document.hasFocus(),

@@ -1,4 +1,4 @@
-// Stuurt meldingen van de content-script door naar de lokale Chronicle-opname,
+// Stuurt meldingen van de content-script door naar de lokale Capture-opname,
 // maar alleen voor het tabblad dat echt actief is: achtergrondtabs melden ook
 // (zodat de gegevens vers zijn zodra je erheen wisselt), maar hun updates
 // negeren we tenzij ze de aandacht hebben.
@@ -21,7 +21,7 @@ chrome.windows.onFocusChanged.addListener(async (windowId) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender) => {
-  if (message?.type !== "chronicle-status") return;
+  if (message?.type !== "capture-status") return;
   const tabId = sender.tab?.id;
   if (tabId === undefined) return;
   if (tabId !== activeTabId && !message.focused) return;

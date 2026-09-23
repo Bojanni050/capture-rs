@@ -597,6 +597,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "capture"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "directories",
+ "fastembed",
+ "image",
+ "regex",
+ "reqwest 0.13.5",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-postgres",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "tray-icon",
+ "uuid",
+ "windows",
+ "windows-core",
+ "winreg",
+ "xcap",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -661,38 +693,6 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "rand_core 0.10.1",
-]
-
-[[package]]
-name = "chronicle"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "chrono",
- "clap",
- "directories",
- "fastembed",
- "image",
- "regex",
- "reqwest 0.13.5",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-postgres",
- "toml 1.1.4+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "tray-icon",
- "uuid",
- "windows",
- "windows-core",
- "winreg",
- "xcap",
 ]
 
 [[package]]

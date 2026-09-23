@@ -1,4 +1,4 @@
-# Chronicle Embeddings — Architecture Proposal
+# Capture Embeddings — Architecture Proposal
 
 ## Status
 Geïmplementeerd, **niet productie-klaar**. `embeddings.enabled` staat
@@ -77,25 +77,25 @@ UIA/OCR → normalize → filter.gate/dedupe/text/privacy → SQLite/FTS5 (truth
 enabled = false
 provider = "fastembed"   # of "mock" voor tests
 model = "intfloat/multilingual-e5-small"
-postgres_url = "postgres://postgres:postgres@127.0.0.1:5432/chronicle"
+postgres_url = "postgres://postgres:postgres@127.0.0.1:5432/capture"
 dimensions = 384
 batch_size = 32
 poll_interval_secs = 5.0
 max_content_chars = 4000
 ```
 
-Env override: `CHRONICLE_POSTGRES_URL` > `postgres_url`. Secrets nooit in TOML log.
+Env override: `CAPTURE_POSTGRES_URL` (legacy: `CHRONICLE_POSTGRES_URL`) > `postgres_url`. Secrets nooit in TOML log.
 
 ## 5. Zoeken
 
 - Behoud `GET /api/search?q=&from=&to=&limit=` voor FTS5.
 - Nieuw: `GET /api/search/semantic?q=&limit=` of `GET /api/search?q=...&semantic=true` — kiest lexicaal vs. vector. Voor v1 aparte endpoint, later hybrid: `lexical + cosine*0.7 + time_decay`.
-- CLI: `chronicle search "kwartaalrapport" --semantic "waar was ik met gaia proxy debugging"` — voegt `--semantic` flag toe naast bestaande `search`.
+- CLI: `capture search "kwartaalrapport" --semantic "waar was ik met gaia proxy debugging"` — voegt `--semantic` flag toe naast bestaande `search`.
 
 ## 6. Provenance & retention
 
 - Elk semantic doc traceerbaar: `capture(id) → segment → app/title/ts/source/has_frame`. API retourneert `source_capture_ids` + `content` + afstand.
-- Purge: `DELETE FROM semantic_documents WHERE end_time < cutoff` in zelfde transactie als `Db::purge`. Rebuild: `chronicle embeddings rebuild` leest SQLite eligible rows, reconstrueert docs, regenereert embeddings (model versie in row laat mix detecteren).
+- Purge: `DELETE FROM semantic_documents WHERE end_time < cutoff` in zelfde transactie als `Db::purge`. Rebuild: `capture embeddings rebuild` leest SQLite eligible rows, reconstrueert docs, regenereert embeddings (model versie in row laat mix detecteren).
 
 ## 7. Implementatievolgorde (kleinste stap eerst)
 
@@ -139,14 +139,14 @@ opgelost:
 - **`InMemoryStore` is niet gedeeld tussen processen.** Zonder `postgres_url`
   bouwt elke processtart zijn eigen lege `Vec` op. `cmd_start` deelt één
   instantie tussen zijn eigen indexer en webserver (vandaar dat de HTTP-API
-  wél werkt), maar een losse CLI-aanroep (`chronicle search --semantic`,
-  `chronicle embeddings status/rebuild`) krijgt altijd een verse, lege store.
+  wél werkt), maar een losse CLI-aanroep (`capture search --semantic`,
+  `capture embeddings status/rebuild`) krijgt altijd een verse, lege store.
   `rebuild` meldt dan "N documenten geïndexeerd" voor werk dat bij het
   afsluiten van het proces alweer weg is — een foutmelding zou hier eerlijker
   zijn dan een geslaagd ogende no-op. Met de cursor nu wél persistent (zie
   boven) geldt dit ook na een herstart: captures die ooit "verwerkt" zijn
   volgens de cursor, maar nooit in een duurzame store terechtkwamen, worden
-  niet opnieuw geprobeerd. Alleen `chronicle embeddings rebuild` haalt ze dan
+  niet opnieuw geprobeerd. Alleen `capture embeddings rebuild` haalt ze dan
   nog terug.
 - **Geen connection pooling.** Elke `VectorStore`-aanroep
   (`ensure_schema`/`upsert`/`search`/`delete_before`/`count`) opent een eigen
@@ -162,4 +162,4 @@ opgelost:
   nergens aangeroepen — `cmd_start` bouwt de indexer rechtstreeks op met
   `rx: None`. De indexer werkt uitsluitend via polling.
 - **Niet genoemd in `README.md`.** Wie het naslaat zonder in `docs/` of
-  `chronicle.toml` te kijken, weet niet dat dit bestaat.
+  `capture.toml` te kijken, weet niet dat dit bestaat.

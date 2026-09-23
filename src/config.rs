@@ -8,10 +8,15 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Waarde uit de omgeving, leeg getrimd beschouwd als niet gezet.
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Waar frames en de database landen. Leeg = %LOCALAPPDATA%\ChronicleCapture.
+    /// Waar frames en de database landen. Leeg = %LOCALAPPDATA%\Capture.
     pub data_dir: Option<PathBuf>,
     pub capture: CaptureConfig,
     pub uia: UiaConfig,
@@ -59,8 +64,8 @@ pub struct ShipConfig {
     /// alles op deze machine.
     pub enabled: bool,
     pub endpoint: String,
-    /// Bearer-token; leeg = uit de omgevingsvariabele `CHRONICLE_INGEST_TOKEN`
-    /// (legacy: `STASH_AUTH_TOKEN`).
+    /// Bearer-token; leeg = uit de omgevingsvariabele `CAPTURE_INGEST_TOKEN`
+    /// (legacy: `CHRONICLE_INGEST_TOKEN`, `STASH_AUTH_TOKEN`).
     pub auth_token: Option<String>,
     pub interval_secs: f64,
 }
@@ -81,12 +86,12 @@ impl ShipConfig {
         self.auth_token
             .clone()
             .filter(|t| !t.trim().is_empty())
-            .or_else(|| {
-                std::env::var("CHRONICLE_INGEST_TOKEN")
-                    .ok()
-                    .filter(|t| !t.trim().is_empty())
-            })
-            .or_else(|| std::env::var("STASH_AUTH_TOKEN").ok().filter(|t| !t.trim().is_empty()))
+            // De CHRONICLE_- en STASH_-namen zijn legacy uit de tijd vóór de
+            // rebrand; die blijven werken zodat bestaande deployments niet
+            // stilzwijgend stoppen met shippen.
+            .or_else(|| env_non_empty("CAPTURE_INGEST_TOKEN"))
+            .or_else(|| env_non_empty("CHRONICLE_INGEST_TOKEN"))
+            .or_else(|| env_non_empty("STASH_AUTH_TOKEN"))
     }
 }
 
@@ -256,7 +261,7 @@ impl Default for FilterConfig {
                 "consent",
                 "lsass",
                 "logonui",
-                "chronicle",
+                "capture",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -303,7 +308,7 @@ pub struct EmbeddingsConfig {
     pub model: String,
     /// Verwachte vector dimensies (voor pgvector schema).
     pub dimensions: usize,
-    /// PostgreSQL connectie-string. Leeg = uit env `CHRONICLE_POSTGRES_URL` of `DATABASE_URL`.
+    /// PostgreSQL connectie-string. Leeg = uit env `CAPTURE_POSTGRES_URL` of `DATABASE_URL`.
     pub postgres_url: Option<String>,
     /// Batch grootte voor embedding aanroepen.
     pub batch_size: usize,
@@ -347,7 +352,10 @@ impl Default for ServerConfig {
 impl Config {
     /// Standaardlocatie van het configuratiebestand.
     pub fn default_path() -> Result<PathBuf> {
-        Ok(app_root()?.join("chronicle.toml"))
+        let root = app_root()?;
+        // Config van vóór de rebrand meenemen naar de nieuwe bestandsnaam.
+        migrate_legacy_file(&root.join(LEGACY_CONFIG), &root.join(CONFIG_NAME));
+        Ok(root.join(CONFIG_NAME))
     }
 
     /// Laadt de config; ontbreekt het bestand, dan gelden de defaults.
@@ -441,10 +449,10 @@ impl Config {
                 return Some(url.clone());
             }
         }
-        std::env::var("CHRONICLE_POSTGRES_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| std::env::var("DATABASE_URL").ok().filter(|s| !s.trim().is_empty()))
+        env_non_empty("CAPTURE_POSTGRES_URL")
+            // Legacy-naam uit de Chronicle-tijd.
+            .or_else(|| env_non_empty("CHRONICLE_POSTGRES_URL"))
+            .or_else(|| env_non_empty("DATABASE_URL"))
     }
 
     /// Schrijft de huidige config weg, maakt tussenliggende mappen aan.
@@ -466,15 +474,19 @@ impl Config {
         };
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("datamap aanmaken mislukt: {}", dir.display()))?;
+        // Bestanden van vóór de rebrand hernoemen, zodat de opgebouwde
+        // geschiedenis en de ship-cursor behouden blijven.
+        migrate_legacy_file(&dir.join(LEGACY_DB), &dir.join(DB_NAME));
+        migrate_legacy_file(&dir.join(LEGACY_LOCK), &dir.join(LOCK_NAME));
         Ok(dir)
     }
 
     pub fn db_path(&self) -> Result<PathBuf> {
-        Ok(self.resolved_data_dir()?.join("chronicle.db"))
+        Ok(self.resolved_data_dir()?.join(DB_NAME))
     }
 
     pub fn lock_path(&self) -> Result<PathBuf> {
-        Ok(self.resolved_data_dir()?.join("chronicle.lock"))
+        Ok(self.resolved_data_dir()?.join(LOCK_NAME))
     }
 
     pub fn frames_dir(&self) -> Result<PathBuf> {
@@ -486,7 +498,7 @@ impl Config {
     /// Waar lokale embeddingmodellen gecached worden. `fastembed`'s eigen
     /// default is een relatief pad (`.fastembed_cache`), dus afhankelijk van
     /// de werkmap zou hetzelfde model telkens opnieuw gedownload kunnen
-    /// worden. Dit legt het naast de rest van Chronicle's data vast.
+    /// worden. Dit legt het naast de rest van Capture's data vast.
     pub fn models_dir(&self) -> Result<PathBuf> {
         let dir = self.resolved_data_dir()?.join("models");
         std::fs::create_dir_all(&dir)?;
@@ -494,8 +506,122 @@ impl Config {
     }
 }
 
-/// %LOCALAPPDATA%\ChronicleCapture (of het platform-equivalent).
+/// %LOCALAPPDATA%\Capture (of het platform-equivalent).
 fn app_root() -> Result<PathBuf> {
     let base = directories::BaseDirs::new().context("geen home-map gevonden")?;
-    Ok(base.data_local_dir().join("ChronicleCapture"))
+    let current = base.data_local_dir().join(APP_DIR);
+    // Map van vóór de rebrand verhuizen, zodat data, config en frames
+    // meegaan naar de nieuwe naam.
+    migrate_legacy_dir(&base.data_local_dir().join(LEGACY_APP_DIR), &current);
+    Ok(current)
+}
+
+const APP_DIR: &str = "Capture";
+const LEGACY_APP_DIR: &str = "ChronicleCapture";
+const CONFIG_NAME: &str = "capture.toml";
+const LEGACY_CONFIG: &str = "chronicle.toml";
+const DB_NAME: &str = "capture.db";
+const LEGACY_DB: &str = "chronicle.db";
+const LOCK_NAME: &str = "capture.lock";
+const LEGACY_LOCK: &str = "chronicle.lock";
+
+/// Hernoemt een bestand van vóór de rebrand naar de nieuwe naam. Doet niets
+/// als het nieuwe bestand al bestaat of het oude ontbreekt, zodat elke aanroep
+/// veilig is. Faalt het hernoemen (bv. bestand in gebruik), dan gaat de app
+/// gewoon verder met een lege stand — liever dat dan een crash bij het starten.
+fn migrate_legacy_file(legacy: &Path, current: &Path) {
+    if current.exists() || !legacy.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::rename(legacy, current) {
+        tracing::warn!(
+            error = %e,
+            van = %legacy.display(),
+            naar = %current.display(),
+            "oude bestand hernoemen naar de nieuwe naam mislukt"
+        );
+    }
+}
+
+/// Zelfde als [`migrate_legacy_file`], maar voor de hele datamap.
+fn migrate_legacy_dir(legacy: &Path, current: &Path) {
+    if current.exists() || !legacy.exists() {
+        return;
+    }
+    if let Some(parent) = current.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::rename(legacy, current) {
+        tracing::warn!(
+            error = %e,
+            van = %legacy.display(),
+            naar = %current.display(),
+            "oude datamap hernoemen naar de nieuwe naam mislukt"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oud_bestand_wordt_naar_de_nieuwe_naam_verhuisd() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(LEGACY_DB);
+        let current = dir.path().join(DB_NAME);
+        std::fs::write(&legacy, "geschiedenis").unwrap();
+
+        migrate_legacy_file(&legacy, &current);
+
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), "geschiedenis");
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn bestaand_nieuw_bestand_wint_het_van_het_oude() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(LEGACY_CONFIG);
+        let current = dir.path().join(CONFIG_NAME);
+        std::fs::write(&legacy, "oud").unwrap();
+        std::fs::write(&current, "nieuw").unwrap();
+
+        migrate_legacy_file(&legacy, &current);
+
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), "nieuw");
+    }
+
+    #[test]
+    fn ontbrekend_oudbestand_is_geen_fout() {
+        let dir = tempfile::tempdir().unwrap();
+        // Doet niets, en al zeker geen fout: dit wordt bij elke start geroepen.
+        migrate_legacy_file(&dir.path().join(LEGACY_LOCK), &dir.path().join(LOCK_NAME));
+        assert!(!dir.path().join(LOCK_NAME).exists());
+    }
+
+    #[test]
+    fn oude_datamap_wordt_met_zijn_inhoud_verhuisd() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(LEGACY_APP_DIR);
+        let current = dir.path().join(APP_DIR);
+        std::fs::create_dir_all(legacy.join("data")).unwrap();
+        std::fs::write(legacy.join("data").join(LEGACY_DB), "geschiedenis").unwrap();
+
+        migrate_legacy_dir(&legacy, &current);
+
+        assert!(!legacy.exists());
+        assert_eq!(
+            std::fs::read_to_string(current.join("data").join(LEGACY_DB)).unwrap(),
+            "geschiedenis"
+        );
+        // De bestandsnaam zelf volgt zodra de datamap wordt geopend.
+        migrate_legacy_file(
+            &current.join("data").join(LEGACY_DB),
+            &current.join("data").join(DB_NAME),
+        );
+        assert_eq!(
+            std::fs::read_to_string(current.join("data").join(DB_NAME)).unwrap(),
+            "geschiedenis"
+        );
+    }
 }

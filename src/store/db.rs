@@ -812,7 +812,7 @@ impl Db {
     }
 
     /// Waar de embeddings-indexer gebleven was, over herstarts heen. Zonder
-    /// dit begon elke `chronicle start` weer bij capture 1 en herembedde de
+    /// dit begon elke `capture start` weer bij capture 1 en herembedde de
     /// hele geschiedenis.
     pub fn load_embeddings_cursor(&self) -> Result<i64> {
         self.lock()

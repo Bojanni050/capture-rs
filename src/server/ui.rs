@@ -6,7 +6,7 @@ pub const PAGE: &str = r##"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Chronicle</title>
+<title>Capture</title>
 <style>
   :root {
     --bg: #f6f7f9; --panel: #ffffff; --line: #e2e5ea; --text: #14171c;
@@ -74,7 +74,7 @@ pub const PAGE: &str = r##"<!doctype html>
 </head>
 <body>
 <header>
-  <h1>Chronicle<span id="range-label">laatste 24 uur</span></h1>
+  <h1>Capture<span id="range-label">laatste 24 uur</span></h1>
   <div class="controls">
     <input type="search" id="q" placeholder="Zoek in alles wat je scherm liet zien…" autofocus>
     <select id="app"><option value="">alle apps</option></select>

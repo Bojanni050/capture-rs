@@ -62,7 +62,7 @@ pub fn spawn(dashboard_url: String, shutdown: tokio::sync::watch::Sender<bool>) 
     let status = TrayStatus::new();
     let status_for_thread = status.clone();
     let spawned = std::thread::Builder::new()
-        .name("chronicle-tray".into())
+        .name("capture-tray".into())
         .spawn(move || {
             if let Err(e) = run(dashboard_url, shutdown, status_for_thread) {
                 tracing::warn!(error = %e, "systemtray-icoon gestopt met een fout");
@@ -83,7 +83,7 @@ fn run(url: String, shutdown: tokio::sync::watch::Sender<bool>, status: TrayStat
         crate::autostart::is_enabled(),
         None,
     );
-    let quit_item = MenuItem::new("Chronicle afsluiten", true, None);
+    let quit_item = MenuItem::new("Capture afsluiten", true, None);
     menu.append(&open_item).context("menu opbouwen mislukt")?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&autostart_item)?;
@@ -167,15 +167,15 @@ fn open_dashboard(url: &str) {
 
 fn tooltip_for(status: Status) -> &'static str {
     match status {
-        Status::Recording => "Chronicle — opname actief",
-        Status::Idle => "Chronicle — je bent even weg",
-        Status::Error => "Chronicle — laatste tik mislukt",
+        Status::Recording => "Capture — opname actief",
+        Status::Idle => "Capture — je bent even weg",
+        Status::Error => "Capture — laatste tik mislukt",
     }
 }
 
 /// Tekent een gevulde, licht antialiased cirkel in de statuskleur. Geen los
 /// .ico-bestand nodig: het icoon wordt in het geheugen opgebouwd uit ruwe
-/// RGBA-pixels, met dezelfde `image`-crate die de rest van Chronicle al
+/// RGBA-pixels, met dezelfde `image`-crate die de rest van Capture al
 /// gebruikt voor screenshots.
 fn dot_icon(status: Status) -> Icon {
     let color = match status {

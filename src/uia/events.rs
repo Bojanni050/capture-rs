@@ -376,7 +376,7 @@ fn run(event_signal: EventSignal, busy: BusySince, ready: std::sync::mpsc::Sende
                 .context("modulehandvat opvragen mislukt")?
                 .into();
 
-        let class_name: Vec<u16> = "ChronicleUiaEvents\0".encode_utf16().collect();
+        let class_name: Vec<u16> = "CaptureUiaEvents\0".encode_utf16().collect();
         let class = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: WNDCLASS_STYLES(0),
@@ -396,7 +396,7 @@ fn run(event_signal: EventSignal, busy: BusySince, ready: std::sync::mpsc::Sende
         // Vensterklassen zijn niet apartment- of thread-gebonden — welke
         // thread ook registreerde, `CreateWindowExW` hieronder werkt gewoon.
 
-        let window_name: Vec<u16> = "ChronicleUiaEventsWindow\0".encode_utf16().collect();
+        let window_name: Vec<u16> = "CaptureUiaEventsWindow\0".encode_utf16().collect();
         let hwnd = unsafe {
             CreateWindowExW(
                 Default::default(),
@@ -534,7 +534,7 @@ fn spawn_window_thread(event_signal: EventSignal, target: Option<HWND>) -> Resul
     let busy_for_thread = busy.clone();
 
     let join_handle = std::thread::Builder::new()
-        .name("chronicle-uia-events".into())
+        .name("capture-uia-events".into())
         .spawn(move || run(event_signal, busy_for_thread, ready_tx))
         .context("uia-events thread starten mislukt")?;
 

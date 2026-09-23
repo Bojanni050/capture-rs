@@ -26,14 +26,14 @@ pub struct OcrService {
 
 impl OcrService {
     /// Start de OCR-thread. Faalt meteen als er geen taalpakket beschikbaar is,
-    /// zodat `chronicle start` een duidelijke fout geeft in plaats van stil
+    /// zodat `capture start` een duidelijke fout geeft in plaats van stil
     /// alles als afbeelding op te slaan.
     pub fn start(language: Option<String>) -> Result<Self> {
         let (tx, mut rx) = mpsc::channel::<Job>(2);
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<String>>();
 
         std::thread::Builder::new()
-            .name("chronicle-ocr".into())
+            .name("capture-ocr".into())
             .spawn(move || {
                 let engine = match WindowsOcr::new(language.as_deref()) {
                     Ok(engine) => {

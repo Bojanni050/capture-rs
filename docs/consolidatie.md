@@ -1,4 +1,4 @@
-# Consolidatievoorstel: chronicle-rs & chroniclecapture
+# Consolidatievoorstel: capture-rs & capture-ui
 
 > Status: voorstel ter beslissing · Aangemaakt: 2026-09-18
 
@@ -8,7 +8,7 @@ Eén activiteitenopname-oplossing ("wat gebeurt er op de computer") in plaats va
 
 ## Wat er nu is
 
-### chronicle-rs (Rust, Windows)
+### capture-rs (Rust, Windows)
 
 Lokale activiteitenopname als native binary, volledig zelf gebouwd:
 
@@ -23,7 +23,7 @@ Lokale activiteitenopname als native binary, volledig zelf gebouwd:
 Sterk: volledige controle, geen externe engine-afhankelijkheid, eigen ruisfilter-IP, Windows-native performance.
 Zwak: alles zelf onderhouden, Windows-only, geen UI.
 
-### chroniclecapture (TypeScript + Rust)
+### capture-ui (TypeScript + Rust)
 
 React/Vite/Tailwind-frontend (dashboard, views, components) met een `screenpipe-engine`-map: een eigen Rust-engine met SQL-migrations, gebaseerd rond Screenpipe.
 
@@ -32,37 +32,37 @@ Zwak: twee ecosystems in één repo, afhankelijk van een extern engine-concept, 
 
 ## Analyse
 
-| Laag | chronicle-rs | chroniclecapture |
+| Laag | capture-rs | capture-ui |
 |---|---|---|
 | Capture (schermtekst) | Eigen: UIA + OCR + 4-laags ruisfilter | Screenpipe-achtige engine |
 | Opslag & API | Eigen `store` + `server` | SQL-migrations in engine |
 | Presentatie | Geen (tray-only) | React-frontend |
 
-De consolidatie is dus geen keuze tussen twee talen, maar **wie de capture-laag levert**. chronicle-rs is inhoudelijk het sterkst: het vierlagen-ruisfilter en de UIA-eerst-aanpak (tekst vóór beeld) past bij het Chronicle Manifest — "neem niets aan, behalve objectieve feiten": gestructureerde tekst eerst, beeld pas als fallback.
+De consolidatie is dus geen keuze tussen twee talen, maar **wie de capture-laag levert**. capture-rs is inhoudelijk het sterkst: het vierlagen-ruisfilter en de UIA-eerst-aanpak (tekst vóór beeld) past bij het Capture Manifest — "neem niets aan, behalve objectieve feiten": gestructureerde tekst eerst, beeld pas als fallback.
 
 ## Voorstel: één repo, drie modules
 
-Consolideer in **chronicle-rs** als thuisbasis, met chroniclecapture's frontend als aparte module:
+Consolideer in **capture-rs** als thuisbasis, met capture-ui's frontend als aparte module:
 
 ```
-chronicle-rs/
+capture-rs/
 ├── engine/          # bestaande Rust-capture (uia, ocr, filter, store, server)
 ├── migrations/      # overgenomen uit screenpipe-engine
-└── app/             # React-frontend uit chroniclecapture (Vite/Tailwind)
+└── app/             # React-frontend uit capture-ui (Vite/Tailwind)
 ```
 
 ### Stappenplan
 
-1. **Beslissen:** bevestig chronicle-rs als canonieke engine en chroniclecapture als te-archiveren repo (na migratie).
-2. **Migrations overzetten:** screenpipe-engine's SQL-migrations naast chronicle-rs' eigen store; kies één schema. Betrek hier ook de `chronicle_knowledge_engine_schema.sql` (Drive).
+1. **Beslissen:** bevestig capture-rs als canonieke engine en capture-ui als te-archiveren repo (na migratie).
+2. **Migrations overzetten:** screenpipe-engine's SQL-migrations naast capture-rs' eigen store; kies één schema. Betrek hier ook de `capture_knowledge_engine_schema.sql` (Drive).
 3. **Server-API stabiliseren:** definieer de REST/API-contract van `src/server` zodanig dat de React-frontend er direct tegen kan praten.
-4. **Frontend aansluiten:** chroniclecapture's views/components verhuizen naar `app/` en praten met de engine-API.
+4. **Frontend aansluiten:** capture-ui's views/components verhuizen naar `app/` en praten met de engine-API.
 5. **Embeddings: één plan:** `docs/embeddings-proposal.md` is de enige roadmap voor semantisch zoeken.
-6. **Archiveren:** chroniclecapture repository archiveren, met verwijzing naar chronicle-rs.
+6. **Archiveren:** capture-ui repository archiveren, met verwijzing naar capture-rs.
 
 ### Overname per repo
 
-| Uit chronicle-rs | Uit chroniclecapture |
+| Uit capture-rs | Uit capture-ui |
 |---|---|
 | Volledige capture-engine (UIA, OCR, ruisfilter) | React-UI met dashboard/views |
 | Store + server | SQL-migrations-benadering |
@@ -71,15 +71,15 @@ chronicle-rs/
 
 ## Risico's & aandachtspunten
 
-- **Scope van "screenpipe":** als chroniclecapture's engine diep verweven is met Screenpipe-upstream, is "zelf onderhouden" (chronicle-rs) vs. "meeliften met upstream" een strategische keuze. Zelf onderhouden past beter bij het manifest, maar kost meer tijd.
+- **Scope van "screenpipe":** als capture-ui's engine diep verweven is met Screenpipe-upstream, is "zelf onderhouden" (capture-rs) vs. "meeliften met upstream" een strategische keuze. Zelf onderhouden past beter bij het manifest, maar kost meer tijd.
 - **Windows-only:** UIA is Windows-specifiek; documenteer dit als expliciete scope-keuze (of plan later een capture-trait met per-OS implementaties).
 - **Eén schema:** twee eigen opslagmodellen betekent tijdelijk dubbele data-formaten — migreer in één keer, niet geleidelijk.
-- **Naamgeving:** overweeg de module in chronicle-rs gewoon `capture` te laten heten (bestaat al) zodat de naamruimte één-talig blijft.
+- **Naamgeving:** overweeg de module in capture-rs gewoon `capture` te laten heten (bestaat al) zodat de naamruimte één-talig blijft.
 
 ## Openstaande beslissing
 
-1. Capture-laag volledig zelf onderhouden (chronicle-rs) of meeliften met Screenpipe-upstream?
-2. Bevestiging van dit voorstel als beslissingsdocument: **chronicle-rs = engine, chroniclecapture = UI-donor**.
+1. Capture-laag volledig zelf onderhouden (capture-rs) of meeliften met Screenpipe-upstream?
+2. Bevestiging van dit voorstel als beslissingsdocument: **capture-rs = engine, capture-ui = UI-donor**.
 
 ## Platform-strategie capture (mobiel)
 
@@ -106,7 +106,7 @@ Het digitale leven volledig in kaart brengen vereist op termijn ook Android- en 
 Mobiele clients worden binnen de Gaia-architectuur representaties van dezelfde Gaia in Gaia Cloud; alleen de capture-methode verschilt per platform. De engine-API (stap 3 van het stappenplan) moet daarom platform-neutraal zijn: clients leveren gestandaardiseerde observaties aan, ongeacht of die via UIA, share-sheet of cloud-import zijn verkregen.
 ## Ingestie-architectuur: één convergentiepunt
 
-Alle observatiestromen — desktop-capture, mobiele capture (Android/iOS), AI-chatarchieven en toekomstige bronnen — komen samen in **één ingestiepunt** in de engine. Dit is de logische plek waar chronicle-rs' server-API en de knowledge-engine elkaar raken.
+Alle observatiestromen — desktop-capture, mobiele capture (Android/iOS), AI-chatarchieven en toekomstige bronnen — komen samen in **één ingestiepunt** in de engine. Dit is de logische plek waar capture-rs' server-API en de knowledge-engine elkaar raken.
 
 ### Waarom één punt
 
