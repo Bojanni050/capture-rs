@@ -110,7 +110,12 @@ impl UiaService {
             .recv()
             .map_err(|_| anyhow!("UIA-thread startte niet"))??;
 
-        let denylist = cfg.app_denylist.iter().map(|a| a.to_lowercase()).collect();
+        let denylist = cfg
+            .app_denylist
+            .iter()
+            .map(|a| crate::filter::privacy::normalize_app_entry(a))
+            .filter(|a| !a.is_empty())
+            .collect();
 
         // Start event-driven UIA als dat ingeschakeld is. De STA-thread bouwt
         // zijn eigen IUIAutomation-instantie op — COM-objecten zijn
@@ -287,7 +292,11 @@ mod tests {
     /// Bouwt een dienst zonder werkthread, zodat de boekhouding los te testen is.
     fn service(cfg: UiaConfig) -> UiaService {
         let (tx, _rx) = mpsc::channel(1);
-        let denylist = cfg.app_denylist.iter().map(|a| a.to_lowercase()).collect();
+        let denylist = cfg
+            .app_denylist
+            .iter()
+            .map(|a| crate::filter::privacy::normalize_app_entry(a))
+            .collect();
         UiaService {
             tx,
             cfg,

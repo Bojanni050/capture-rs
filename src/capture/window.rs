@@ -127,7 +127,13 @@ pub fn foreground() -> Option<WindowInfo> {
             return None;
         }
 
-        let (exe_path, exe) = process_image(pid).unwrap_or_default();
+        // Lukt de naamvraag niet (verhoogd proces, SYSTEM), dan is er geen
+        // app-naam om aan een denylist te toetsen. Zo'n venster teruggeven
+        // zou het langs elke uitsluiting laten glippen, dus melden we het
+        // als "geen bruikbaar venster" — de volgende tik probeert opnieuw.
+        let Some((exe_path, exe)) = process_image(pid) else {
+            return None;
+        };
 
         Some(WindowInfo {
             title,
@@ -176,7 +182,10 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
         return true.into();
     }
 
-    let (exe_path, exe) = process_image(pid).unwrap_or_default();
+    // Zonder procesnaam is er niets waar `doctor` zinnig mee kan toetsen.
+    let Some((exe_path, exe)) = process_image(pid) else {
+        return true.into();
+    };
     out.push(WindowInfo {
         title,
         exe,

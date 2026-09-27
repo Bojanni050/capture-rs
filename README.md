@@ -276,7 +276,7 @@ min_quality = 0.38         # lagere score dan dit → beeld-fallback
 [filter]
 phash_threshold = 4        # hoger = meer frames gelden als "onveranderd"
 boilerplate_ratio = 0.6    # regel in >60% van de frames = vaste UI
-app_denylist = ["bitwarden", "keepass", "1password", ...]
+app_denylist = ["bitwarden", "keepass", "1password", ...]  # kale naam of met .exe; paden worden ook gesnapt
 redact = true
 
 [browser]

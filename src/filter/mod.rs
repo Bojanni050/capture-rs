@@ -38,6 +38,7 @@ pub enum Gate {
 pub enum SkipReason {
     NoWindow,
     Idle,
+    UnknownApp,
     DeniedApp,
     DeniedTitle,
 }
@@ -47,6 +48,7 @@ impl SkipReason {
         match self {
             SkipReason::NoWindow => "geen actief venster",
             SkipReason::Idle => "idle",
+            SkipReason::UnknownApp => "procesnaam onbekend",
             SkipReason::DeniedApp => "app op denylist",
             SkipReason::DeniedTitle => "titel op denylist",
         }
@@ -147,7 +149,15 @@ impl NoiseFilter {
         if self.cfg.skip_when_idle && idle_secs >= idle_after {
             return Gate::Skip(SkipReason::Idle);
         }
-        if self.denylist.blocks_app(&window.app_key()) {
+        let app_key = window.app_key();
+        // Een venster waarvan de procesnaam niet te achterhalen was (leeg)
+        // kan nooit aan een denylist-entry voldoen — en dus ook niet aan een
+        // uitsluiting die de gebruiker bedoelde. Privacy gaat vóór opname:
+        // lege app-naam = niet vastleggen.
+        if app_key.trim().is_empty() {
+            return Gate::Skip(SkipReason::UnknownApp);
+        }
+        if self.denylist.blocks_app(&app_key) {
             return Gate::Skip(SkipReason::DeniedApp);
         }
         if self.denylist.blocks_title(&window.title) {
@@ -297,6 +307,18 @@ mod tests {
     #[test]
     fn geen_venster_wordt_overgeslagen() {
         assert_eq!(filter().gate(None, 0, 90), Gate::Skip(SkipReason::NoWindow));
+    }
+
+    #[test]
+    fn venster_zonder_procesnaam_wordt_overgeslagen() {
+        // Een venster waarvan de procesnaam niet te achterhalen was, kan nooit
+        // aan een denylist voldoen — dus ook niet aan een uitsluiting die de
+        // gebruiker bedoelde. Privacy gaat vóór opname.
+        let f = filter();
+        assert_eq!(
+            f.gate(Some(&window("", "Hoe dan ook")), 0, 90),
+            Gate::Skip(SkipReason::UnknownApp)
+        );
     }
 
     #[test]

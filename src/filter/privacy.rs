@@ -71,6 +71,16 @@ impl Redactor {
     }
 }
 
+/// Brengt één `app_denylist`-entry naar de vorm waarin we vergelijken:
+/// kleine letters, zonder `.exe` en zonder mappen uit een meegegeven pad.
+/// `app_key` van een venster is namelijk de kale procesnaam, dus een entry
+/// als `"bitwarden.exe"` of `"C:\\Tools\\keepass.exe"` zou anders nooit matchen.
+pub(crate) fn normalize_app_entry(entry: &str) -> String {
+    let trimmed = entry.trim();
+    let name = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed);
+    name.strip_suffix(".exe").unwrap_or(name).to_lowercase()
+}
+
 /// Beslist of een venster überhaupt vastgelegd mag worden.
 pub struct Denylist {
     apps: Vec<String>,
@@ -85,7 +95,14 @@ impl Denylist {
                 .push(Regex::new(t).with_context(|| format!("ongeldige title_denylist-regex: {t}"))?);
         }
         Ok(Self {
-            apps: apps.iter().map(|a| a.to_lowercase()).collect(),
+            apps: apps
+                .iter()
+                .map(|a| normalize_app_entry(a))
+                // Een lege entry normaliseert tot "" en `contains("")` is
+                // altijd waar — die zou élk venster blokkeren in plaats van
+                // geen.
+                .filter(|a| !a.is_empty())
+                .collect(),
             titles: compiled,
         })
     }
@@ -147,5 +164,19 @@ mod tests {
         assert!(!d.blocks_app("notepad"));
         assert!(d.blocks_title("Nieuw tabblad - Incognito"));
         assert!(!d.blocks_title("Nieuw tabblad"));
+    }
+
+    #[test]
+    fn entry_met_exe_of_pad_wordt_ook_een_match() {
+        // `app_key` is de kale procesnaam zonder .exe; een entry die die vorm
+        // niet heeft zou stilletjos nooit matchen.
+        let d = Denylist::new(
+            &["Bitwarden.exe".into(), "C:\\Tools\\KeePass.exe".into()],
+            &[],
+        )
+        .unwrap();
+        assert!(d.blocks_app("bitwarden"));
+        assert!(d.blocks_app("keepass"));
+        assert!(!d.blocks_app("notepad"));
     }
 }
