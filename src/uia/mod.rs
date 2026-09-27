@@ -161,6 +161,33 @@ impl UiaService {
         self.read_via_worker(app_key, hwnd).await
     }
 
+    /// Meldt de event-registratie af voor het huidige venster. Voor een app op
+    /// de denylist mag Capture geen enkele UIA-aanroep meer doen — ook de
+    /// event-registratie niet, want ook die wordt door de provider zelf
+    /// bediend en kan een trage app verder belasten.
+    pub fn detach_events(&mut self) {
+        if let Some(manager) = &self.event_manager {
+            manager.detach();
+        }
+    }
+
+    /// Wisselt de event-registratie naar een nieuw venster, mits die app niet op
+    /// de uia-denylist staat. De leesroute (`read`) controleerde de denylist
+    /// al; deze aanroep deed dat niet, waardoor een geweigerde app alsnog een
+    /// event-registratie opliep bij elke voorgrondwissel.
+    pub fn switch_events(&mut self, app_key: &str, hwnd: isize) {
+        if self.is_denied(app_key) {
+            self.detach_events();
+            return;
+        }
+        if let Some(manager) = &self.event_manager {
+            let hwnd_obj = HWND(hwnd as *mut core::ffi::c_void);
+            if let Err(e) = manager.switch_window(hwnd_obj) {
+                tracing::debug!(app = app_key, error = %e, "UIA event registratie mislukt");
+            }
+        }
+    }
+
     /// Geeft een ontvanger die bij elke UIA-wijziging wakker wordt. De waarde
     /// zelf is alleen een versieteller; de pipeline leest daarna via de
     /// bestaande worker met deadline en behandelt het event nooit als data.
@@ -279,6 +306,17 @@ mod tests {
         });
         assert!(s.is_denied("photoshop"));
         assert!(!s.is_denied("notepad"));
+    }
+
+    #[test]
+    fn everything_staat_standaard_op_de_uia_denylist() {
+        // De default-denylist bestaat om precies dit probleem: de
+        // gevirtualiseerde lijst van Everything bevriest onder de
+        // subtree-sweep.
+        assert!(UiaConfig::default()
+            .app_denylist
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("everything")));
     }
 
     #[test]

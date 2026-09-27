@@ -98,6 +98,12 @@ Drie dingen om te weten:
 - **Niet elke app doet mee.** PowerShell en sommige Electron-apps geven een lege
   boom. Capture onthoudt dat per app en zet UIA daar tijdelijk uit, zodat je
   niet elke tik opnieuw voor niets wacht.
+- **Sommige apps vriezen er zélf op.** Een gevirtualiseerde lijst als die van
+  Everything (voidtools) bevat makkelijk miljoenen knopen, en die moet de app
+  zelf op zijn UI-thread aanmaken voor de subtree-sweep — de app loopt dan vast,
+  ook al houdt Captures eigen `timeout_ms` zich aan de deadline. Daarom staat
+  `everything` standaard op de uia `app_denylist`: zo'n venster wordt gewoon
+  via OCR gelezen en krijgt ook geen event-registratie.
 
 `capture doctor` probeert UIA op al je open vensters en zegt per app of het
 werkt — de snelste manier om te zien wat jouw mix oplevert.
@@ -261,7 +267,7 @@ min_text_len = 120           # minder tekens dan dit -> doorschuiven naar OCR
 timeout_ms = 2500            # daarna gaat OCR verder; de boom mag doorwerken
 failures_before_skip = 3     # daarna gaat uia voor die app tijdelijk uit
 retry_after_secs = 600       # en krijgt hij daarna weer een kans
-app_denylist = []            # apps waarvoor je uia nooit wilt proberen
+app_denylist = ["everything"] # apps waarvoor je uia nooit wilt proberen
 
 [ocr]
 min_text_len = 24          # minder tekens dan dit → beeld-fallback

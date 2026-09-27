@@ -626,6 +626,20 @@ impl UiaEventThread {
         Ok(())
     }
 
+    /// Meldt de registratie voor het huidige venster af en houdt daarna geen
+    /// thread meer vast. Voor apps op de uia-denylist: daar wil Capture geen
+    /// enkele aanroep meer naartoe doen, dus ook geen events ontvangen.
+    pub fn detach(&self) {
+        if let Some(old) = self
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            retire_window_thread(old, Arc::clone(&self.abandoned));
+        }
+    }
+
     /// Meldt of de thread van het huidige venster vastzit in zijn
     /// registratie. Zie `WindowThread::warn_if_stuck`.
     pub fn warn_if_stuck(&self, app_key: &str) {

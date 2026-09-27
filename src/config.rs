@@ -150,7 +150,11 @@ impl Default for UiaConfig {
             timeout_ms: 2_500,
             failures_before_skip: 3,
             retry_after_secs: 600,
-            app_denylist: Vec::new(),
+            // Everything (voidtools) heeft een gevirtualiseerde lijst met
+            // miljoenen items; de subtree-sweep uit `FindAllBuildCache` bevriest
+            // die app. `timeout_ms` beschermt Capture, niet de app aan de andere
+            // kant. OCR leest dit venster gewoon.
+            app_denylist: vec!["everything".into()],
         }
     }
 }

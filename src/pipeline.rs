@@ -43,7 +43,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::block_in_place;
-use windows::Win32::Foundation::HWND;
 
 /// Hoe vaak we het geleerde boilerplate-geheugen wegschrijven (in tikken).
 const FLUSH_EVERY: u64 = 50;
@@ -335,19 +334,17 @@ impl Pipeline {
         }
 
         // Als event-driven UIA ingeschakeld is, wissel de event-registratie
-        // naar het nieuwe voorgrondvenster. `switch_window` start daarvoor
+        // naar het nieuwe voorgrondvenster. `switch_events` start daarvoor
         // een eigen thread en laat de vorige los, zodat een vastzittende
         // registratie voor het oude venster nooit de events van dit venster
-        // blokkeert (zie de moduledocumentatie in `uia/events.rs`).
-        if let Some(ref uia_service) = self.uia
+        // blokkeert (zie de moduledocumentatie in `uia/events.rs`). Apps op
+        // de uia-denylist krijgen geen registratie: ook die aanroep loopt bij
+        // de provider zelf en belast een app die al trage UIA-reacties heeft.
+        if let Some(ref mut uia_service) = self.uia
             && uia_service.cfg.event_driven
-            && let Some(ref manager) = uia_service.event_manager
             && self.last_hwnd != Some(window.hwnd)
         {
-            let hwnd_obj = HWND(window.hwnd as *mut core::ffi::c_void);
-            if let Err(e) = manager.switch_window(hwnd_obj) {
-                tracing::debug!(app = app_key, error = %e, "UIA event registratie mislukt");
-            }
+            uia_service.switch_events(&app_key, window.hwnd);
             self.last_hwnd = Some(window.hwnd);
         }
 
