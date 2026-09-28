@@ -111,6 +111,8 @@ pub struct Pipeline {
     last_hwnd: Option<isize>,
     tray: Option<TrayStatus>,
     browser: Option<Arc<BrowserState>>,
+    /// Gedeelde momentopname voor de webinterface (`/api/status`).
+    status: Option<crate::server::SharedStatus>,
 }
 
 impl Pipeline {
@@ -168,11 +170,22 @@ impl Pipeline {
             last_hwnd: None,
             tray: None,
             browser: None,
+            status: None,
         })
     }
 
     pub fn monitors(&self) -> String {
         self.capturer.describe()
+    }
+
+    /// Taal waarin OCR echt herkent, of None als OCR uit staat of mislukte.
+    pub fn ocr_language(&self) -> Option<String> {
+        self.ocr.as_ref().map(|o| o.language().to_string())
+    }
+
+    /// Of UI Automation echt gestart is (niet alleen aangevinkt in de config).
+    pub fn uia_active(&self) -> bool {
+        self.uia.is_some()
     }
 
     /// Koppelt een systemtray-icoon: elke tik werkt daarna de kleur bij
@@ -186,6 +199,11 @@ impl Pipeline {
         self.browser = Some(browser);
     }
 
+    /// Koppelt de gedeelde systeemstatus voor de webinterface (`/api/status`).
+    pub fn attach_status(&mut self, status: crate::server::SharedStatus) {
+        self.status = Some(status);
+    }
+
     /// Draait tot `shutdown` afgaat.
     pub async fn run(&mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
         let mut maintenance = tokio::time::interval(MAINTENANCE_INTERVAL);
@@ -193,12 +211,18 @@ impl Pipeline {
         let (foreground_events, mut foreground_changes) = match ForegroundEvents::start() {
             Ok(events) => {
                 tracing::info!("voorgrondvenster-events actief");
+                if let Some(status) = &self.status {
+                    crate::server::set_foreground_events(status, true);
+                }
                 (Some(events.0), events.1)
             }
             Err(e) => {
                 // De periodieke route blijft volledig bruikbaar wanneer een
                 // sandbox of oude Windows-versie geen hook toestaat.
                 tracing::warn!(error = %e, "voorgrondvenster-events niet beschikbaar; alleen interval actief");
+                if let Some(status) = &self.status {
+                    crate::server::set_foreground_events(status, false);
+                }
                 let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 // Houd geen hook vast; de receiver sluit nooit en de
                 // fallback-timer blijft de opname aansturen.

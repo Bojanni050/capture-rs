@@ -11,6 +11,7 @@ mod config;
 mod embeddings;
 mod filter;
 mod lock;
+mod logs;
 mod ocr;
 mod pipeline;
 mod server;
@@ -25,7 +26,7 @@ use clap::{Parser, Subcommand};
 use config::Config;
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use store::{Db, FrameStore, SearchQuery};
 
 #[derive(Parser)]
@@ -50,14 +51,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start de opname (en standaard ook de webinterface).
+    /// Start de opname (standaard met webinterface, tray-icoon en zonder consolevenster).
     Start {
         /// Draai alleen de opname, zonder webserver.
         #[arg(long)]
         no_server: bool,
-        /// Toon een systemtray-icoon (groen/geel/rood naar gelang de status).
+        /// Toon een systemtray-icoon. Legacy-vlag: staat standaard aan, zie --no-tray.
         #[arg(long)]
         tray: bool,
+        /// Geen systemtray-icoon tonen (standaard staat het aan).
+        #[arg(long, conflicts_with = "tray")]
+        no_tray: bool,
+        /// Maak het proces los van de console: geen venster en geen taakbalkknop.
+        /// Legacy-vlag: staat standaard aan, zie --show-console. Je eigen terminal
+        /// blijft staan maar kan veilig dicht: Capture draait door via het tray-icoon.
+        #[arg(long)]
+        hide_console: bool,
+        /// Houd het consolevenster zichtbaar (standaard wordt het verborgen).
+        #[arg(long, conflicts_with = "hide_console")]
+        show_console: bool,
     },
     /// Alleen de webinterface, zonder op te nemen.
     Serve,
@@ -193,7 +205,8 @@ async fn main() -> Result<()> {
     };
 
     let cli = Cli::parse();
-    init_logging(cli.verbose);
+    let log_buffer = logs::LogBuffer::new();
+    init_logging(cli.verbose, &log_buffer);
 
     // Eenmalig: oude `Chronicle`-opstartregistratie omzetten naar `Capture`.
     autostart::migrate_legacy();
@@ -201,8 +214,16 @@ async fn main() -> Result<()> {
     let (cfg, cfg_path) = Config::load(cli.config.as_deref())?;
 
     match cli.command {
-        Command::Start { no_server, tray } => cmd_start(cfg, no_server, tray).await,
-        Command::Serve => cmd_serve(cfg).await,
+        Command::Start { no_server, tray, no_tray, hide_console, show_console } => {
+            // Tray en een losgekoppelde console zijn de standaard: Capture hoort op
+            // de achtergrond te leven, met het icoon als bediening en de
+            // webinterface als status. `--tray`/`--hide-console` bestaan nog
+            // zodat oude scripts en autostart-opdrachten blijven werken.
+            let (tray, hide_console) =
+                resolve_start_flags(tray, no_tray, hide_console, show_console);
+            cmd_start(cfg, no_server, tray, hide_console, log_buffer).await
+        }
+        Command::Serve => cmd_serve(cfg, log_buffer).await,
         Command::Search {
             query,
             app,
@@ -237,7 +258,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn init_logging(verbose: u8) {
+fn init_logging(verbose: u8, buffer: &logs::LogBuffer) {
     let level = match verbose {
         0 => tracing::Level::INFO,
         1 => tracing::Level::DEBUG,
@@ -247,8 +268,36 @@ fn init_logging(verbose: u8) {
         .with_max_level(level)
         .with_target(false)
         .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(std::io::stderr)
+        .with_writer(logs::TeeWriter::new(buffer.clone()))
         .init();
+}
+
+/// Koppelt het proces los van de console. Daarna bezit Capture geen enkel
+/// consolevenster meer — dus ook geen knop in de taakbalk — waar verbergen
+/// (`ShowWindow`) onder Windows Terminal het verkeerde (of geen) venster
+/// raakt. Het tray-icoon blijft de bediening en de status staat in de
+/// webinterface (`/api/status`); logregels gaan ondertussen door naar de
+/// logbuffer voor `/api/logs` (stderr is na dit punt ongeldig, zie `logs.rs`).
+///
+/// Start je vanuit een eigen terminal, dan blijft die zelf staan (hij wacht
+/// op het proces) maar kun je hem veilig sluiten: Capture draait door.
+fn detach_console() {
+    use windows::Win32::System::Console::FreeConsole;
+    unsafe {
+        let _ = FreeConsole();
+    }
+}
+
+/// Tray en een losgekoppelde console staan standaard aan; expliciet uitzetten wint.
+/// `--tray` en `--no-tray` (en hun console-tegenhangers) sluiten elkaar uit
+/// via `conflicts_with`, dus dit is nooit tegenstrijdig.
+fn resolve_start_flags(
+    tray: bool,
+    no_tray: bool,
+    hide_console: bool,
+    show_console: bool,
+) -> (bool, bool) {
+    (tray || !no_tray, hide_console || !show_console)
 }
 
 /// Opent database en frame-opslag op basis van de config.
@@ -262,13 +311,27 @@ fn open_store(cfg: &Config) -> Result<(Arc<Db>, Arc<FrameStore>)> {
     Ok((db, frames))
 }
 
-async fn cmd_start(cfg: Config, no_server: bool, tray: bool) -> Result<()> {
+async fn cmd_start(
+    cfg: Config,
+    no_server: bool,
+    tray: bool,
+    hide_console: bool,
+    logs: logs::LogBuffer,
+) -> Result<()> {
+    if hide_console {
+        detach_console();
+    }
     // Moet vóór `open_store` gebeuren: twee `start`-instanties die allebei
     // hun eigen migratie/WAL-initialisatie op dezelfde database doen, is
     // precies wat de database eerder corrumpeerde (zie `lock.rs`).
     let _lock = lock::InstanceLock::acquire(&cfg.lock_path()?)?;
 
     let (db, frames) = open_store(&cfg)?;
+
+    // Gedeelde momentopname voor de webinterface (`/api/status`): alles wat
+    // je anders in de terminal zou aflezen.
+    let shared_status = Arc::new(RwLock::new(server::SystemStatus::new(&cfg, true)));
+    server::set_console_hidden(&shared_status, hide_console);
 
     // Bouw server state mét embeddings store (optioneel) voor API.
     let embeddings_store = if cfg.embeddings.enabled {
@@ -288,6 +351,8 @@ async fn cmd_start(cfg: Config, no_server: bool, tray: bool) -> Result<()> {
             frames: Arc::clone(&frames),
             embeddings_store: embeddings_store.clone(),
             embeddings_provider: embeddings_provider.clone(),
+            status: Arc::clone(&shared_status),
+            logs: logs.clone(),
         };
         match server::serve(state, &cfg.server.bind, cfg.server.port).await {
             Ok(addr) => tracing::info!("webinterface op http://{addr}"),
@@ -326,12 +391,18 @@ async fn cmd_start(cfg: Config, no_server: bool, tray: bool) -> Result<()> {
     let browser_state = if cfg.browser.enabled {
         let state = Arc::new(browser::BrowserState::default());
         match browser::serve(Arc::clone(&state), cfg.browser.port).await {
-            Ok(addr) => tracing::info!("browser-bridge op http://{addr}"),
-            Err(e) => tracing::warn!(
-                error = %e,
-                poort = cfg.browser.port,
-                "browser-bridge kon niet starten (draait er nog een oude CodexCapture-agent?); domeinuitsluiting werkt niet"
-            ),
+            Ok(addr) => {
+                tracing::info!("browser-bridge op http://{addr}");
+                server::set_browser_running(&shared_status, true);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    poort = cfg.browser.port,
+                    "browser-bridge kon niet starten (draait er nog een oude CodexCapture-agent?); domeinuitsluiting werkt niet"
+                );
+                server::set_browser_running(&shared_status, false);
+            }
         }
         Some(state)
     } else {
@@ -339,10 +410,22 @@ async fn cmd_start(cfg: Config, no_server: bool, tray: bool) -> Result<()> {
     };
 
     let shipper_handle = cfg.ship.enabled.then(|| {
-        tokio::spawn(ship::run(cfg.ship.clone(), Arc::clone(&db), rx.clone()))
+        tokio::spawn(ship::run(
+            cfg.ship.clone(),
+            Arc::clone(&db),
+            rx.clone(),
+            Some(Arc::clone(&shared_status)),
+        ))
     });
 
     let mut pipeline = pipeline::Pipeline::new(cfg, Arc::clone(&db), Arc::clone(&frames))?;
+    pipeline.attach_status(Arc::clone(&shared_status));
+    server::set_pipeline_info(
+        &shared_status,
+        pipeline.uia_active(),
+        pipeline.ocr_language(),
+        pipeline.monitors(),
+    );
     if let Some(state) = browser_state {
         pipeline.attach_browser(state);
     }
@@ -375,7 +458,7 @@ async fn cmd_start(cfg: Config, no_server: bool, tray: bool) -> Result<()> {
     res
 }
 
-async fn cmd_serve(cfg: Config) -> Result<()> {
+async fn cmd_serve(cfg: Config, logs: logs::LogBuffer) -> Result<()> {
     let (db, frames) = open_store(&cfg)?;
     let embeddings_store = if cfg.embeddings.enabled {
         Some(embeddings::make_store(&cfg))
@@ -392,6 +475,10 @@ async fn cmd_serve(cfg: Config) -> Result<()> {
         frames,
         embeddings_store,
         embeddings_provider,
+        // Alleen de webinterface: er draait geen opname, dus de status
+        // blijft op de config-waarden (uia_active=false, geen schermen).
+        status: Arc::new(RwLock::new(server::SystemStatus::new(&cfg, false))),
+        logs,
     };
     let addr = server::serve(state, &cfg.server.bind, cfg.server.port).await?;
     println!("Webinterface draait op http://{addr} — Ctrl+C om te stoppen.");
@@ -1089,5 +1176,15 @@ mod tests {
     fn afkappen_telt_in_tekens_niet_bytes() {
         assert_eq!(truncate("hallo", 10), "hallo");
         assert_eq!(truncate("café-avond", 4), "café…");
+    }
+
+    #[test]
+    fn tray_en_verborgen_console_zijn_standaard_aan() {
+        // Kale `start`: allebei aan.
+        assert_eq!(resolve_start_flags(false, false, false, false), (true, true));
+        // Legacy-vlaggen veranderen daar niets aan.
+        assert_eq!(resolve_start_flags(true, false, true, false), (true, true));
+        // Expliciet uitzetten wint.
+        assert_eq!(resolve_start_flags(false, true, false, true), (false, false));
     }
 }

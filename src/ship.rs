@@ -110,7 +110,12 @@ async fn ship_once(
     }
 }
 
-pub async fn run(cfg: ShipConfig, db: Arc<Db>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run(
+    cfg: ShipConfig,
+    db: Arc<Db>,
+    mut shutdown: watch::Receiver<bool>,
+    status: Option<crate::server::SharedStatus>,
+) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -131,7 +136,12 @@ pub async fn run(cfg: ShipConfig, db: Arc<Db>, mut shutdown: watch::Receiver<boo
     loop {
         match ship_once(&client, &cfg, token.as_deref(), &db).await {
             Ok(0) => {}
-            Ok(n) => tracing::info!(captures = n, "naar Foundation Gateway verzonden"),
+            Ok(n) => {
+                if let Some(status) = &status {
+                    crate::server::note_shipped(status, n);
+                }
+                tracing::info!(captures = n, "naar Foundation Gateway verzonden")
+            }
             // Nooit fataal: de opname loopt door en de cursor bewaart de achterstand.
             Err(e) => tracing::warn!(error = format!("{e:#}"), "shippen mislukt; volgende ronde opnieuw"),
         }

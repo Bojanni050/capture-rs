@@ -8,16 +8,18 @@
 mod ui;
 
 use crate::embeddings::{store::VectorStore, EmbeddingProvider};
+use crate::logs::LogBuffer;
 use crate::store::{Db, FrameStore, SearchQuery};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Deserialize;
+use chrono::Local;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,6 +27,110 @@ pub struct AppState {
     pub frames: Arc<FrameStore>,
     pub embeddings_store: Option<Arc<dyn VectorStore>>,
     pub embeddings_provider: Option<Arc<dyn EmbeddingProvider>>,
+    pub status: SharedStatus,
+    pub logs: LogBuffer,
+}
+
+/// Momentopname van het draaiende proces voor de webinterface: alles wat je
+/// anders in de terminal zou aflezen bij het opstarten (webinterface-adres,
+/// bridge, shipper, UIA, OCR, schermen) plus wat er sindsdien gebeurde.
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemStatus {
+    pub version: String,
+    pub started_at: i64,
+    /// true bij `start`, false bij `serve` (alleen webinterface, geen opname).
+    pub recording: bool,
+    pub server_bind: String,
+    pub server_port: u16,
+    pub browser_enabled: bool,
+    pub browser_port: u16,
+    /// Of de bridge echt gestart is (kan mislukken als de poort bezet is).
+    pub browser_running: bool,
+    pub ship_enabled: bool,
+    pub ship_endpoint: String,
+    pub ship_total: u64,
+    pub ship_last_count: Option<usize>,
+    pub ship_last_at: Option<i64>,
+    pub uia_enabled: bool,
+    /// Of UIA echt gestart is (niet alleen aangevinkt in de config).
+    pub uia_active: bool,
+    pub ocr_enabled: bool,
+    pub ocr_language: Option<String>,
+    pub monitors: String,
+    /// None = de opname is nog niet ver genoeg om het te weten.
+    pub foreground_events: Option<bool>,
+    pub autostart: bool,
+    pub console_hidden: bool,
+}
+
+impl SystemStatus {
+    pub fn new(cfg: &crate::config::Config, recording: bool) -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            started_at: Local::now().timestamp(),
+            recording,
+            server_bind: cfg.server.bind.clone(),
+            server_port: cfg.server.port,
+            browser_enabled: cfg.browser.enabled,
+            browser_port: cfg.browser.port,
+            browser_running: false,
+            ship_enabled: cfg.ship.enabled,
+            ship_endpoint: cfg.ship.endpoint.clone(),
+            ship_total: 0,
+            ship_last_count: None,
+            ship_last_at: None,
+            uia_enabled: cfg.uia.enabled,
+            uia_active: false,
+            ocr_enabled: cfg.ocr.enabled,
+            ocr_language: None,
+            monitors: String::new(),
+            foreground_events: None,
+            autostart: crate::autostart::is_enabled(),
+            console_hidden: false,
+        }
+    }
+}
+
+pub type SharedStatus = Arc<RwLock<SystemStatus>>;
+
+fn lock(status: &SharedStatus) -> std::sync::RwLockWriteGuard<'_, SystemStatus> {
+    // Zelfde redenatie als `Db::lock`: een vergiftigde mutex betekent een
+    // paniek elders; de laatst bekende status tonen is beter dan crashen.
+    status.write().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn set_browser_running(status: &SharedStatus, running: bool) {
+    lock(status).browser_running = running;
+}
+
+pub fn set_console_hidden(status: &SharedStatus, hidden: bool) {
+    lock(status).console_hidden = hidden;
+}
+
+/// Wat de pipeline bij het opstarten echt aantrof (tegenover de config).
+pub fn set_pipeline_info(
+    status: &SharedStatus,
+    uia_active: bool,
+    ocr_language: Option<String>,
+    monitors: String,
+) {
+    let mut s = lock(status);
+    s.uia_active = uia_active;
+    s.ocr_language = ocr_language;
+    s.monitors = monitors;
+}
+
+pub fn set_foreground_events(status: &SharedStatus, active: bool) {
+    lock(status).foreground_events = Some(active);
+}
+
+/// Houdt bij wat de shipper verzond, voor de "naar Foundation Gateway
+/// verzonden"-regel uit de terminal.
+pub fn note_shipped(status: &SharedStatus, count: usize) {
+    let mut s = lock(status);
+    s.ship_total += count as u64;
+    s.ship_last_count = Some(count);
+    s.ship_last_at = Some(Local::now().timestamp());
 }
 
 /// Fouten netjes als JSON teruggeven in plaats van een kale 500.
@@ -61,6 +167,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/capture/{id}", get(capture))
         .route("/api/frame/{id}", get(frame))
         .route("/api/embeddings/status", get(embeddings_status))
+        .route("/api/status", get(status))
+        .route("/api/logs", get(logs))
         .with_state(state)
 }
 
@@ -250,4 +358,19 @@ async fn embeddings_status(State(state): State<AppState>) -> ApiResult<Json<serd
         Ok(n) => Ok(Json(json!({"enabled": true, "count": n, "available": store.is_available()}))),
         Err(e) => Ok(Json(json!({"enabled": true, "error": e.to_string()}))),
     }
+}
+
+/// Dezelfde regels als in de terminal bij het opstarten, maar dan als staat.
+async fn status(State(state): State<AppState>) -> ApiResult<Json<SystemStatus>> {
+    let snapshot = state
+        .status
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    Ok(Json(snapshot))
+}
+
+/// De laatste logregels uit het geheugen (zie `logs.rs`).
+async fn logs(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(json!({ "logs": state.logs.recent() }))
 }

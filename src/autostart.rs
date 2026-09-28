@@ -15,10 +15,11 @@ const VALUE_NAME: &str = "Capture";
 const LEGACY_VALUE_NAME: &str = "Chronicle";
 
 /// De opdrachtregel die bij het inloggen wordt uitgevoerd: dezelfde binary,
-/// met het systemtray-icoon aan.
+/// met het systemtray-icoon aan en zonder consolevenster (de status staat
+/// dan in de webinterface).
 fn command_line() -> io::Result<String> {
     let exe = std::env::current_exe()?;
-    Ok(format!("\"{}\" start --tray", exe.display()))
+    Ok(format!("\"{}\" start --tray --hide-console", exe.display()))
 }
 
 /// Staat er een `Capture`-waarde in de `Run`-sleutel? Elke leesfout (de

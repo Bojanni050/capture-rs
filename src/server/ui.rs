@@ -70,6 +70,14 @@ pub const PAGE: &str = r##"<!doctype html>
   .empty { color: var(--muted); padding: 24px 4px; }
   .note { color: var(--muted); font-size: 12px; margin: 8px 0 12px;
           border-left: 2px solid var(--line); padding-left: 10px; }
+  details.logs { margin-top: 10px; color: var(--muted); font-size: 12px; }
+  details.logs summary { cursor: pointer; }
+  #logs { margin-top: 6px; max-height: 220px; overflow: auto;
+          background: var(--bg); border: 1px solid var(--line);
+          border-radius: 7px; padding: 8px 10px;
+          font: 11.5px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; }
+  #logs .log-WARN { color: #a16207; }
+  #logs .log-ERROR { color: #b91c1c; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -91,6 +99,11 @@ pub const PAGE: &str = r##"<!doctype html>
     </select>
   </div>
   <div class="stats" id="stats"></div>
+  <div class="stats" id="status"></div>
+  <details class="logs">
+    <summary>Processtatus en logregels (wat anders in de terminal staat)</summary>
+    <div id="logs">Laden…</div>
+  </details>
 </header>
 
 <main>
@@ -228,6 +241,60 @@ async function appLijst() {
     apps.map((a) => `<option value="${esc(a)}">${esc(a)}</option>`).join("");
 }
 
+// Dezelfde regels als in de terminal bij het opstarten, maar dan als staat.
+async function statusbalk() {
+  let s;
+  try {
+    const res = await fetch("/api/status");
+    if (!res.ok) return;
+    s = await res.json();
+  } catch {
+    return;
+  }
+  const delen = [`<span><b>v${esc(s.version)}</b></span>`];
+  delen.push(s.recording
+    ? "<span><b>●</b> opname actief</span>"
+    : "<span>alleen webinterface</span>");
+  if (s.monitors) delen.push(`<span>schermen: ${esc(s.monitors)}</span>`);
+  delen.push(`<span>uia: ${s.uia_active ? "actief" : s.uia_enabled ? "startte niet" : "uit"}</span>`);
+  delen.push(`<span>ocr: ${s.ocr_language ? esc(s.ocr_language) : s.ocr_enabled ? "startte niet" : "uit"}</span>`);
+  if (s.browser_enabled) {
+    delen.push(`<span>bridge: ${s.browser_running ? "actief op :" + s.browser_port : "poort bezet"}</span>`);
+  }
+  if (s.ship_enabled) {
+    const laatste = s.ship_last_count != null
+      ? ` — laatste batch ${s.ship_last_count}`
+      : "";
+    delen.push(`<span>shipper: ${s.ship_total} verzonden${laatste}</span>`);
+  } else {
+    delen.push("<span>alles blijft lokaal</span>");
+  }
+  delen.push(`<span>events: ${s.foreground_events == null ? "…" : s.foreground_events ? "actief" : "alleen interval"}</span>`);
+  delen.push(`<span>autostart: ${s.autostart ? "aan" : "uit"}</span>`);
+  delen.push(`<span>gestart: ${tijd(s.started_at)}</span>`);
+  $("status").innerHTML = delen.join("");
+}
+
+async function logregels() {
+  let logs;
+  try {
+    const res = await fetch("/api/logs");
+    if (!res.ok) return;
+    ({ logs } = await res.json());
+  } catch {
+    return;
+  }
+  if (!logs || logs.length === 0) {
+    $("logs").textContent = "Nog geen regels.";
+    return;
+  }
+  $("logs").innerHTML = logs.map((l) =>
+    `<div class="log-${esc(l.level)}">${esc(l.ts)} ${esc(l.level)} ${esc(l.text)}</div>`
+  ).join("");
+  const box = $("logs");
+  box.scrollTop = box.scrollHeight;
+}
+
 let timer;
 function ververs() {
   clearTimeout(timer);
@@ -245,8 +312,14 @@ $("range").onchange = () => {
 appLijst();
 zoek();
 statistieken();
+statusbalk();
+logregels();
 // Terwijl de opname draait komt er vanzelf nieuw materiaal bij.
-setInterval(() => { if (!$("q").value.trim()) { zoek(); statistieken(); } }, 15000);
+setInterval(() => { if (!$("q").value.trim()) { zoek(); statistieken(); } statusbalk(); }, 15000);
+// Logregels alleen verversen als het blok openstaat.
+setInterval(() => {
+  if (document.querySelector("details.logs").open) logregels();
+}, 5000);
 </script>
 </body>
 </html>

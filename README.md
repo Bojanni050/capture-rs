@@ -202,8 +202,9 @@ De binary staat in `target/release/capture.exe`.
 
 ```bash
 capture doctor              # controleer uia per app, OCR, schermen, database
-capture start               # opnemen + webinterface op 127.0.0.1:7331
-capture start --tray        # hetzelfde, plus een systemtray-icoon
+capture start               # opnemen + webinterface + tray-icoon, helemaal los van de console
+capture start --show-console --no-tray  # klassiek: alles in de terminal
+capture start --tray --hide-console  # hetzelfde als kaal `start` (legacy-vlaggen)
 capture start --no-server   # alleen opnemen
 capture serve               # alleen de webinterface
 
@@ -220,8 +221,8 @@ capture autostart status
 
 ## Systemtray-icoon en automatisch opstarten
 
-`capture start --tray` toont een stip in de systemtray die de status van de
-opname laat zien:
+`capture start` toont standaard een stip in de systemtray die de status van de
+opname laat zien (uit te zetten met `--no-tray`):
 
 | Kleur | Betekent |
 |---|---|
@@ -239,7 +240,7 @@ aan te hoeven zetten:
 capture autostart enable
 ```
 
-Dit zet `capture.exe start --tray` in de `Run`-sleutel van je eigen
+Dit zet `capture.exe start --tray --hide-console` in de `Run`-sleutel van je eigen
 Windows-account (`HKCU\...\Run`) — geen adminrechten nodig, en het start pas
 ná inloggen (dus met je bureaublad en schermen al actief). `capture
 autostart disable` zet het weer uit; `capture autostart status` laat zien
@@ -317,6 +318,8 @@ dat dan achter een proxy die de toegang regelt.
 | `GET /api/capture/{id}` | Eén capture, volledige tekst en de bron (`uia`/`ocr`) |
 | `GET /api/frame/{id}` | De bewaarde afbeelding (JPEG) |
 | `GET /api/apps` | Alle apps die zijn gezien |
+| `GET /api/status` | Processtatus (wat anders in de terminal staat) |
+| `GET /api/logs` | De laatste logregels uit het geheugen |
 
 Bruikbaar om een LLM je eigen geschiedenis te laten bevragen:
 
