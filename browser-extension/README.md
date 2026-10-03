@@ -20,6 +20,17 @@ dan stil.
 Werkt in elke Chromium-browser (Chrome, Edge, Brave, Opera, Vivaldi). Firefox
 heeft een eigen port nodig; zonder extensie werkt daar alleen de UIA-controle.
 
+## Statusindicator
+
+Klik op het extensie-icoon voor een popup met de actuele stand:
+
+- **groen — Capture draait**: bridge bereikbaar; toont ook het laatst
+  gemelde domein en of dat een wachtwoordveld zag (oranje = uitgesloten).
+- **rood — Capture niet bereikbaar**: start `capture start` of check de
+  poort.
+
+De popup leest `GET /browser-status` en verstuurt zelf niets.
+
 ## Van wie accepteert de bridge meldingen?
 
 Alleen van extensies (`Origin: chrome-extension://…`) of van clients zonder

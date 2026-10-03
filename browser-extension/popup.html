@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      font-size: 13px;
+      width: 260px;
+      margin: 0;
+      padding: 12px;
+    }
+    .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #9aa0a6; flex: none;
+    }
+    .dot.ok   { background: #34a853; }
+    .dot.warn { background: #fbbc04; }
+    .dot.err  { background: #ea4335; }
+    .muted { color: #5f6368; }
+    .hostname { font-weight: 600; word-break: break-all; }
+    small { color: #5f6368; }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <span class="dot" id="bridge-dot"></span>
+    <span id="bridge-label">Bridge controleren…</span>
+  </div>
+  <div class="row">
+    <span class="dot" id="site-dot"></span>
+    <span id="site-label">Geen site</span>
+  </div>
+  <small id="hint">De popup verversen toont de actuele stand.</small>
+  <script src="popup.js"></script>
+</body>
+</html>

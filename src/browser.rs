@@ -20,6 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use serde::Deserialize;
+use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -119,9 +120,31 @@ async fn report(
     with_cors(StatusCode::NO_CONTENT.into_response(), origin)
 }
 
+/// Helderheid voor de extensie-popup: wat is de laatst bekende staat en
+/// hoe oud mag die zijn? Lees-only, dus de Origin-check uit `report` is
+/// hier niet nodig — een webpagina die dit leest leert alleen wat Capture
+/// toch al van haar weet.
+async fn status(State(state): State<Arc<BrowserState>>) -> Response {
+    let fresh = Duration::from_secs(60);
+    let body = match state.current(fresh) {
+        Some((hostname, has_password_field)) => json!({
+            "running": true,
+            "hostname": hostname,
+            "hasPasswordField": has_password_field,
+        }),
+        None => json!({ "running": false }),
+    };
+    let mut response = body.to_string().into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
 pub fn router(state: Arc<BrowserState>) -> Router {
     Router::new()
-        .route("/browser-status", post(report).options(preflight))
+        .route("/browser-status", post(report).options(preflight).get(status))
         .with_state(state)
 }
 
@@ -211,5 +234,32 @@ mod tests {
 
         let bad = post_raw(addr, None, "geen json");
         assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+    }
+
+    fn get_raw(addr: SocketAddr) -> String {
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        write!(
+            stream,
+            "GET /browser-status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).unwrap();
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_toont_de_actuele_staat_voor_de_popup() {
+        let state = Arc::new(BrowserState::default());
+        let addr = serve(Arc::clone(&state), 0).await.unwrap();
+
+        let leeg = get_raw(addr);
+        assert!(leeg.starts_with("HTTP/1.1 200"), "{leeg}");
+        assert!(leeg.contains("{\"running\":false}"), "{leeg}");
+
+        state.update("mijnbank.com", true);
+        let vol = get_raw(addr);
+        assert!(vol.contains("\"hostname\":\"mijnbank.com\""), "{vol}");
+        assert!(vol.contains("\"hasPasswordField\":true"), "{vol}");
     }
 }
