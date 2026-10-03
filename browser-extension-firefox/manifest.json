@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Capture Browser Bridge",
+  "version": "1.1.0",
+  "description": "Meldt het domein van het actieve tabblad en of er een wachtwoordveld staat aan de lokale Capture-opname, zodat die per domein kan uitsluiten.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "capture-browser-bridge@capture-rs",
+      "strict_min_version": "115.0"
+    }
+  },
+  "permissions": ["tabs"],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1:8765/*"],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Capture Browser Bridge"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

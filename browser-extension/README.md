@@ -17,8 +17,8 @@ dan stil.
 2. **Uitgepakte extensie laden** → kies deze map `browser-extension/`
 3. Zorg dat `capture start` draait; die opent de bridge op poort 8765
 
-Werkt in elke Chromium-browser (Chrome, Edge, Brave, Opera, Vivaldi). Firefox
-heeft een eigen port nodig; zonder extensie werkt daar alleen de UIA-controle.
+Werkt in elke Chromium-browser (Chrome, Edge, Brave, Opera, Vivaldi).
+Voor Firefox bestaat een eigen port: zie `../browser-extension-firefox/`.
 
 ## Statusindicator
 
