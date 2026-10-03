@@ -24,6 +24,16 @@ Een tijdelijke add-on verdwijnt weer bij herstarten van Firefox.
 Permanente installatie vereist ondertekening via
 addons.mozilla.org — voor eigen gebruik is tijdelijk laden genoeg.
 
+## Automatisch laden en herladen
+
+```bash
+./install.sh              # web-ext run + --watch: herlaadt bij elke wijziging
+./install.sh --watch off  # alleen installeren, niet kijken naar wijzigingen
+```
+
+Vereist Node.js; installeert `web-ext` automatisch als het ontbreekt.
+Dood de sessie met Ctrl+C; de add-on verdwijnt dan met Firefox.
+
 ## Statusindicator
 
 Klik op het extensie-icoon voor de popup met de actuele stand,

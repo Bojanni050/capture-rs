@@ -20,6 +20,18 @@ dan stil.
 Werkt in elke Chromium-browser (Chrome, Edge, Brave, Opera, Vivaldi).
 Voor Firefox bestaat een eigen port: zie `../browser-extension-firefox/`.
 
+## Automatisch laden
+
+```powershell
+.\install.ps1                # Chrome
+.\install.ps1 -Browser Edge # of brave / vivaldi / opera
+```
+
+Start de browser met de extensie en een tijdelijk profiel; met
+`-ProfileDir <pad>` maak je de sessie blijvend. Herladen na een
+wijziging: script opnieuw draaien of de "Herlaad"-knop in
+`chrome://extensions`.
+
 ## Statusindicator
 
 Klik op het extensie-icoon voor een popup met de actuele stand:
