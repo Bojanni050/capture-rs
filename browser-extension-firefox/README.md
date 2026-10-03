@@ -27,11 +27,13 @@ addons.mozilla.org — voor eigen gebruik is tijdelijk laden genoeg.
 ## Automatisch laden en herladen
 
 ```bash
-./install.sh              # web-ext run + --watch: herlaadt bij elke wijziging
-./install.sh --watch off  # alleen installeren, niet kijken naar wijzigingen
+./install.sh              # web-ext run: herlaadt automatisch bij elke wijziging
+./install.sh --no-reload  # alleen installeren, niet kijken naar wijzigingen
 ```
 
 Vereist Node.js; installeert `web-ext` automatisch als het ontbreekt.
+Auto-herlaad is web-ext's `--reload` (standaard aan). Extra opties
+gaan 1-op-1 naar `web-ext run` door, bv. `./install.sh --devtools`.
 Dood de sessie met Ctrl+C; de add-on verdwijnt dan met Firefox.
 
 ## Statusindicator
