@@ -3,9 +3,12 @@
 //!
 //! Elke capture met tekst gaat als eigen JSON-object naar de Gateway; de
 //! Gateway bepaalt status ("observation") en slaat hem op in Postgres. De
-//! identiteit van een capture ligt in url = capture://capture/<id>, dus
+//! identiteit van een capture ligt in url = capture://capture/<ts>-<id>, dus
 //! een dubbel-verzonden capture wordt door Foundation ge-updated in plaats
-//! van verdubbeld.
+//! van verdubbeld. De timestamp hoort erbij omdat de lokale ids na verlies
+//! van de database opnieuw beginnen: alleen `<id>` zou dan een ándere capture
+//! onder dezelfde url schuiven en Foundation een oude observatie laten
+//! overschrijven.
 //!
 //! Betrouwbaarheid komt van een cursor in SQLite (ship_cursor), niet van
 //! bestandjes: de cursor schuift pas op nadat de Gateway de hele batch met
@@ -43,7 +46,7 @@ fn to_payload(row: &CaptureRow) -> serde_json::Value {
         "content": row.index_text,
         "source": "capture-rs",
         "title": format!("{} — {}", row.app, row.title),
-        "url": format!("capture://capture/{}", row.id),
+        "url": format!("capture://capture/{}-{}", row.ts, row.id),
         "tags": [row.app],
         "occurredAt": rfc3339(row.ts),
     })
@@ -303,7 +306,7 @@ mod tests {
             let bodies = received.bodies.lock().unwrap();
             assert_eq!(bodies.len(), 1);
             assert_eq!(bodies[0]["content"], "wel tekst");
-            assert_eq!(bodies[0]["url"], format!("capture://capture/{tekst_id}"));
+            assert_eq!(bodies[0]["url"], format!("capture://capture/{}-{}", 4_100, tekst_id));
         }
 
         // Tweede ronde: niets meer te doen, ook de lege niet opnieuw.
