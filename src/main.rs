@@ -281,10 +281,33 @@ fn init_logging(verbose: u8, buffer: &logs::LogBuffer) {
 ///
 /// Start je vanuit een eigen terminal, dan blijft die zelf staan (hij wacht
 /// op het proces) maar kun je hem veilig sluiten: Capture draait door.
+///
+/// `FreeConsole` geeft de handle-nummers van stdout/stderr vrij. Zonder
+/// tegenmaatregel krijgt het eerstvolgende bestand dat Capture opent — het
+/// lockbestand of de database — zo'n nummer, en belandt elke volgende
+/// `stderr`-write van tracing ín dat bestand. Zo raakten `capture.lock` (en in
+/// eerdere opstellingen de database) gevuld met logregels en raakte het
+/// databaseschema beschadigd. We wijzen stdout/stderr daarom direct naar `NUL`
+/// vóórdat er nog maar iets geopend wordt.
 fn detach_console() {
-    use windows::Win32::System::Console::FreeConsole;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{
+        FreeConsole, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    };
     unsafe {
         let _ = FreeConsole();
+    }
+    // Het NUL-apparaat als sink voor alles wat het proces hierna nog naar
+    // stdout/stderr schrijft. De handle moet het proces overleven: we lekken
+    // hem bewust (één handle, voor de hele looptijd).
+    if let Ok(nul) = std::fs::OpenOptions::new().write(true).open("NUL") {
+        let handle = HANDLE(nul.as_raw_handle());
+        unsafe {
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, handle);
+            let _ = SetStdHandle(STD_ERROR_HANDLE, handle);
+        }
+        std::mem::forget(nul);
     }
 }
 
