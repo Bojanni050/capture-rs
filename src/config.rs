@@ -104,6 +104,11 @@ pub struct CaptureConfig {
     pub idle_interval_secs: f64,
     /// Vanaf hoeveel seconden zonder toetsenbord/muis je als idle telt.
     pub idle_after_secs: u64,
+    /// Minimale afstand (seconden) tussen twee tikken die door UIA-inhouds-
+    /// events worden gewekt. Elke tik leest de volledige UIA-boom; zonder
+    /// ondergrens kan een venster dat voortdurend verandert (chat, animaties)
+    /// de CPU continu bezig houden. De vaste timer valt hier niet onder.
+    pub min_wake_secs: f64,
     /// "primary", "all", of een monitor-index ("0", "1", ...).
     pub monitor: String,
 }
@@ -231,6 +236,7 @@ impl Default for CaptureConfig {
             interval_secs: 4.0,
             idle_interval_secs: 60.0,
             idle_after_secs: 90,
+            min_wake_secs: 2.0,
             monitor: "primary".into(),
         }
     }
@@ -389,6 +395,9 @@ impl Config {
                 "capture.interval_secs moet tussen 0.1 en 3600 liggen (gevonden {})",
                 self.capture.interval_secs
             ));
+        }
+        if !(0.0..=60.0).contains(&self.capture.min_wake_secs) {
+            return Err(anyhow!("capture.min_wake_secs moet tussen 0 en 60 liggen"));
         }
         if self.capture.idle_interval_secs < 0.0 || self.capture.idle_interval_secs > 3600.0 {
             return Err(anyhow!(

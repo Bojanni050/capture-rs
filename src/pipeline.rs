@@ -51,6 +51,9 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3_600);
 /// Geeft een nieuw voorgrondvenster even de tijd om zijn titel/UIA-boom bij te
 /// werken en voorkomt captures tijdens een snelle Alt-Tab-reeks.
 const FOREGROUND_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Tikken die langer duren dan dit worden op info-niveau gelogd, zodat zichtbaar
+/// wordt wat een opname (UIA/OCR/screenshot) kost.
+const SLOW_TICK: Duration = Duration::from_millis(1_000);
 
 struct Segment {
     id: i64,
@@ -235,11 +238,23 @@ impl Pipeline {
         // periodieke fallback altijd blijft werken.
         let mut uia_changes = self.uia.as_ref().and_then(UiaService::subscribe_events);
 
+        // Wordt aan het eind van elke tik gezet, voordat de wacht-select hem leest.
+        let mut last_tick: std::time::Instant;
+
         loop {
             let idle = idle_seconds();
             let sleeping = idle >= self.cfg.capture.idle_after_secs;
 
-            if let Err(e) = self.tick(idle).await {
+            let tick_started = std::time::Instant::now();
+            let tick_result = self.tick(idle).await;
+            let tick_elapsed = tick_started.elapsed();
+            last_tick = std::time::Instant::now();
+            if tick_elapsed >= SLOW_TICK {
+                tracing::info!(tick_ms = tick_elapsed.as_millis() as u64, "trage tik");
+            } else {
+                tracing::debug!(tick_ms = tick_elapsed.as_millis() as u64, "tik klaar");
+            }
+            if let Err(e) = tick_result {
                 tracing::warn!(error = %e, "tik overgeslagen");
                 if let Some(tray) = &self.tray {
                     tray.set(TrayState::Error);
@@ -286,6 +301,16 @@ impl Pipeline {
                     // periode; wachten voorkomt een capture midden in een
                     // reeks DOM-/layoutwijzigingen.
                     tokio::time::sleep(FOREGROUND_DEBOUNCE).await;
+                    // Inhoudswijzigingen kunnen zeer vaak komen (chat die
+                    // streamt, pagina's met animaties). Elke wake leest de
+                    // volledige UIA-boom, dus houden we een minimale afstand
+                    // tot de vorige tik aan.
+                    let min_wake =
+                        Duration::from_secs_f64(self.cfg.capture.min_wake_secs.max(0.0));
+                    let since_last = last_tick.elapsed();
+                    if since_last < min_wake {
+                        tokio::time::sleep(min_wake - since_last).await;
+                    }
                 }
             }
         }
