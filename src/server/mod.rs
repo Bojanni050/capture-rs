@@ -7,19 +7,23 @@
 
 mod ui;
 
-use crate::embeddings::{store::VectorStore, EmbeddingProvider};
+use crate::embeddings::{EmbeddingProvider, store::VectorStore};
 use crate::logs::LogBuffer;
 use crate::store::{Db, FrameStore, SearchQuery};
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+const TICK_METRICS_WINDOW: usize = 1_000;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -61,6 +65,50 @@ pub struct SystemStatus {
     pub foreground_events: Option<bool>,
     pub autostart: bool,
     pub console_hidden: bool,
+    /// Proceslokale, rollende tikmetingen en skip-redenen.
+    pub tick_metrics: TickMetrics,
+}
+
+/// Tikduurstatistieken over de laatste 1.000 voltooide tikken. `completed_ticks`
+/// is cumulatief; gemiddelde en p95 gebruiken alleen het rollende samplevenster.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TickMetrics {
+    pub completed_ticks: u64,
+    pub sample_size: usize,
+    pub latest_ms: Option<f64>,
+    pub average_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub skipped_by_reason: BTreeMap<String, u64>,
+    #[serde(skip)]
+    samples_ms: VecDeque<f64>,
+}
+
+impl TickMetrics {
+    fn record_tick(&mut self, elapsed: Duration) {
+        let elapsed_ms = elapsed.as_secs_f64() * 1_000.0;
+        self.completed_ticks = self.completed_ticks.saturating_add(1);
+        self.latest_ms = Some(elapsed_ms);
+        self.samples_ms.push_back(elapsed_ms);
+        if self.samples_ms.len() > TICK_METRICS_WINDOW {
+            self.samples_ms.pop_front();
+        }
+        self.sample_size = self.samples_ms.len();
+
+        let mut sorted: Vec<_> = self.samples_ms.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let average = sorted.iter().sum::<f64>() / sorted.len() as f64;
+        let p95_index = ((sorted.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+        self.average_ms = Some(average);
+        self.p95_ms = sorted.get(p95_index).copied();
+    }
+
+    fn record_skip(&mut self, reason: &str) {
+        let count = self
+            .skipped_by_reason
+            .entry(reason.to_string())
+            .or_default();
+        *count = count.saturating_add(1);
+    }
 }
 
 impl SystemStatus {
@@ -87,6 +135,7 @@ impl SystemStatus {
             foreground_events: None,
             autostart: crate::autostart::is_enabled(),
             console_hidden: false,
+            tick_metrics: TickMetrics::default(),
         }
     }
 }
@@ -122,6 +171,14 @@ pub fn set_pipeline_info(
 
 pub fn set_foreground_events(status: &SharedStatus, active: bool) {
     lock(status).foreground_events = Some(active);
+}
+
+pub fn record_tick_duration(status: &SharedStatus, elapsed: Duration) {
+    lock(status).tick_metrics.record_tick(elapsed);
+}
+
+pub fn record_skip_reason(status: &SharedStatus, reason: &str) {
+    lock(status).tick_metrics.record_skip(reason);
 }
 
 /// Houdt bij wat de shipper verzond, voor de "naar Foundation Gateway
@@ -280,17 +337,18 @@ async fn apps(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value
     Ok(Json(json!({ "apps": apps })))
 }
 
-async fn capture(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> ApiResult<Response> {
+async fn capture(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
     let db = Arc::clone(&state.db);
     let cap = tokio::task::spawn_blocking(move || db.capture(id))
         .await
         .map_err(|e| anyhow::anyhow!("capture task panicked: {e}"))??;
     match cap {
         Some(c) => Ok(Json(c).into_response()),
-        None => Ok((StatusCode::NOT_FOUND, Json(json!({ "error": "niet gevonden" }))).into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "niet gevonden" })),
+        )
+            .into_response()),
     }
 }
 
@@ -333,10 +391,14 @@ async fn semantic_search(
     Query(p): Query<SemanticSearchParams>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let Some(store) = state.embeddings_store else {
-        return Ok(Json(json!({"error": "embeddings uitgeschakeld", "hits": []})));
+        return Ok(Json(
+            json!({"error": "embeddings uitgeschakeld", "hits": []}),
+        ));
     };
     let Some(provider) = state.embeddings_provider else {
-        return Ok(Json(json!({"error": "geen embedding provider", "hits": []})));
+        return Ok(Json(
+            json!({"error": "geen embedding provider", "hits": []}),
+        ));
     };
     if p.q.trim().is_empty() {
         return Ok(Json(json!({"hits": [], "count": 0})));
@@ -355,7 +417,9 @@ async fn embeddings_status(State(state): State<AppState>) -> ApiResult<Json<serd
         return Ok(Json(json!({"enabled": false, "count": 0})));
     };
     match store.count().await {
-        Ok(n) => Ok(Json(json!({"enabled": true, "count": n, "available": store.is_available()}))),
+        Ok(n) => Ok(Json(
+            json!({"enabled": true, "count": n, "available": store.is_available()}),
+        )),
         Err(e) => Ok(Json(json!({"enabled": true, "error": e.to_string()}))),
     }
 }
@@ -373,4 +437,45 @@ async fn status(State(state): State<AppState>) -> ApiResult<Json<SystemStatus>> 
 /// De laatste logregels uit het geheugen (zie `logs.rs`).
 async fn logs(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({ "logs": state.logs.recent() }))
+}
+
+#[cfg(test)]
+mod tick_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn tikstatistieken_gebruiken_rollend_venster_en_p95() {
+        let mut metrics = TickMetrics::default();
+        metrics.record_tick(Duration::from_millis(10));
+        metrics.record_tick(Duration::from_millis(20));
+        metrics.record_tick(Duration::from_millis(100));
+
+        assert_eq!(metrics.completed_ticks, 3);
+        assert_eq!(metrics.sample_size, 3);
+        assert_eq!(metrics.latest_ms, Some(100.0));
+        assert_eq!(metrics.average_ms, Some(130.0 / 3.0));
+        assert_eq!(metrics.p95_ms, Some(100.0));
+
+        for _ in 0..TICK_METRICS_WINDOW {
+            metrics.record_tick(Duration::from_millis(5));
+        }
+        assert_eq!(metrics.sample_size, TICK_METRICS_WINDOW);
+        assert_eq!(metrics.completed_ticks, (TICK_METRICS_WINDOW + 3) as u64);
+        assert_eq!(metrics.latest_ms, Some(5.0));
+    }
+
+    #[test]
+    fn skip_redenen_worden_per_reden_geteld() {
+        let mut metrics = TickMetrics::default();
+        metrics.record_skip("zelfde tekst");
+        metrics.record_skip("zelfde tekst");
+        metrics.record_skip("wachtwoordveld");
+
+        assert_eq!(metrics.skipped_by_reason["zelfde tekst"], 2);
+        assert_eq!(metrics.skipped_by_reason["wachtwoordveld"], 1);
+
+        let json = serde_json::to_value(metrics).unwrap();
+        assert_eq!(json["skipped_by_reason"]["zelfde tekst"], 2);
+        assert!(json.get("samples_ms").is_none());
+    }
 }

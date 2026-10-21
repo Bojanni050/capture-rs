@@ -10,18 +10,21 @@ use super::document::SemanticDocument;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticHit {
     pub document: SemanticDocument,
-    pub score: f32, // cosine similarity 0..1 (hoger = meer vergelijkbaar)
+    pub score: f32,      // cosine similarity 0..1 (hoger = meer vergelijkbaar)
     pub snippet: String, // eerste 220 chars van content
 }
 
 #[async_trait]
 pub trait VectorStore: Send + Sync {
     async fn ensure_schema(&self) -> Result<()>;
-    async fn upsert(&self, docs: Vec<SemanticDocument>, embeddings: Vec<Vec<f32>>) -> Result<usize>;
+    async fn upsert(&self, docs: Vec<SemanticDocument>, embeddings: Vec<Vec<f32>>)
+    -> Result<usize>;
     async fn search(&self, query_embedding: Vec<f32>, limit: usize) -> Result<Vec<SemanticHit>>;
     async fn delete_before(&self, cutoff_ts: i64) -> Result<usize>;
     async fn count(&self) -> Result<usize>;
     fn is_available(&self) -> bool;
+    /// Whether indexed documents survive process restarts.
+    fn is_durable(&self) -> bool;
 }
 
 // ---------------------------------------------------------------------------
@@ -46,12 +49,19 @@ impl VectorStore for InMemoryStore {
     async fn ensure_schema(&self) -> Result<()> {
         Ok(())
     }
-    async fn upsert(&self, docs: Vec<SemanticDocument>, embeddings: Vec<Vec<f32>>) -> Result<usize> {
+    async fn upsert(
+        &self,
+        docs: Vec<SemanticDocument>,
+        embeddings: Vec<Vec<f32>>,
+    ) -> Result<usize> {
         let mut guard = self.docs.write().unwrap();
         let mut n = 0;
         for (doc, emb) in docs.into_iter().zip(embeddings) {
             // Dedup op content_hash
-            if guard.iter().any(|(d, _)| d.content_hash == doc.content_hash) {
+            if guard
+                .iter()
+                .any(|(d, _)| d.content_hash == doc.content_hash)
+            {
                 continue;
             }
             guard.push((doc, emb));
@@ -89,6 +99,9 @@ impl VectorStore for InMemoryStore {
     }
     fn is_available(&self) -> bool {
         true
+    }
+    fn is_durable(&self) -> bool {
+        false
     }
 }
 
@@ -145,7 +158,9 @@ impl VectorStore for PgVectorStore {
         let (client, conn) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
             .await
             .context("postgres connect faalde")?;
-        tokio::spawn(async move { let _ = conn.await; });
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
 
         // Probeer vector extensie — als niet beschikbaar, geef duidelijke fout.
         let ext = client
@@ -155,7 +170,9 @@ impl VectorStore for PgVectorStore {
             )
             .await?;
         if ext.is_none() {
-            anyhow::bail!("pgvector extensie 'vector' niet beschikbaar — installeer pgvector voor PG 18 (zie docs/embeddings-proposal.md)");
+            anyhow::bail!(
+                "pgvector extensie 'vector' niet beschikbaar — installeer pgvector voor PG 18 (zie docs/embeddings-proposal.md)"
+            );
         }
         client
             .execute("CREATE EXTENSION IF NOT EXISTS vector", &[])
@@ -199,14 +216,20 @@ impl VectorStore for PgVectorStore {
         Ok(())
     }
 
-    async fn upsert(&self, docs: Vec<SemanticDocument>, embeddings: Vec<Vec<f32>>) -> Result<usize> {
+    async fn upsert(
+        &self,
+        docs: Vec<SemanticDocument>,
+        embeddings: Vec<Vec<f32>>,
+    ) -> Result<usize> {
         if docs.is_empty() {
             return Ok(0);
         }
         let (client, conn) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
             .await
             .context("postgres connect faalde")?;
-        tokio::spawn(async move { let _ = conn.await; });
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
 
         let mut n = 0;
         for (doc, emb) in docs.into_iter().zip(embeddings) {
@@ -246,7 +269,9 @@ impl VectorStore for PgVectorStore {
         let (client, conn) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
             .await
             .context("postgres connect faalde")?;
-        tokio::spawn(async move { let _ = conn.await; });
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
 
         let vec_lit = Self::vector_literal(&query);
         let lim = limit as i64;
@@ -292,9 +317,14 @@ impl VectorStore for PgVectorStore {
         let (client, conn) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
             .await
             .context("postgres connect faalde")?;
-        tokio::spawn(async move { let _ = conn.await; });
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
         let n = client
-            .execute("DELETE FROM semantic_documents WHERE end_time < $1", &[&cutoff])
+            .execute(
+                "DELETE FROM semantic_documents WHERE end_time < $1",
+                &[&cutoff],
+            )
             .await?;
         Ok(n as usize)
     }
@@ -303,7 +333,9 @@ impl VectorStore for PgVectorStore {
         let (client, conn) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
             .await
             .context("postgres connect faalde")?;
-        tokio::spawn(async move { let _ = conn.await; });
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
         let row = client
             .query_one("SELECT COUNT(*) FROM semantic_documents", &[])
             .await?;
@@ -313,13 +345,17 @@ impl VectorStore for PgVectorStore {
     fn is_available(&self) -> bool {
         true
     }
+
+    fn is_durable(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embeddings::{document::SemanticDocument, provider::MockProvider};
     use crate::embeddings::provider::EmbeddingProvider;
+    use crate::embeddings::{document::SemanticDocument, provider::MockProvider};
 
     #[tokio::test]
     async fn in_memory_upsert_en_search() {
@@ -372,5 +408,11 @@ mod tests {
         store.upsert(vec![doc], vec![vec![0.1; 384]]).await.unwrap();
         assert_eq!(store.delete_before(200).await.unwrap(), 1);
         assert_eq!(store.count().await.unwrap(), 0);
+    }
+
+    #[test]
+    fn alleen_persistent_store_is_duurzaam() {
+        assert!(!InMemoryStore::new().is_durable());
+        assert!(PgVectorStore::new("postgres://localhost/capture", 384, "mock").is_durable());
     }
 }

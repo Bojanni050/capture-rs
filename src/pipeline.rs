@@ -31,7 +31,7 @@ use crate::capture::{
     window_rect,
 };
 use crate::config::{Config, FramePolicy};
-use crate::filter::{dedupe, Gate, NoiseFilter};
+use crate::filter::{Gate, NoiseFilter, dedupe};
 use crate::ocr::OcrService;
 use crate::store::{Db, FrameStore, NewCapture};
 use crate::tray::{Status as TrayState, TrayStatus};
@@ -177,6 +177,30 @@ impl Pipeline {
         })
     }
 
+    #[cfg(test)]
+    fn for_test(cfg: Config, db: Arc<Db>, frames: Arc<FrameStore>) -> Result<Self> {
+        let mut filter = NoiseFilter::new(cfg.filter.clone())?;
+        for (app, frames_seen, lines) in db.load_boilerplate()? {
+            filter.restore(&app, frames_seen, lines);
+        }
+        Ok(Self {
+            cfg,
+            db,
+            frames,
+            uia: None,
+            ocr: None,
+            filter,
+            capturer: ScreenCapturer::for_test(),
+            segment: None,
+            app_ids: HashMap::new(),
+            ticks: 0,
+            last_hwnd: None,
+            tray: None,
+            browser: None,
+            status: None,
+        })
+    }
+
     pub fn monitors(&self) -> String {
         self.capturer.describe()
     }
@@ -248,6 +272,9 @@ impl Pipeline {
             let tick_started = std::time::Instant::now();
             let tick_result = self.tick(idle).await;
             let tick_elapsed = tick_started.elapsed();
+            if let Some(status) = &self.status {
+                crate::server::record_tick_duration(status, tick_elapsed);
+            }
             last_tick = std::time::Instant::now();
             if tick_elapsed >= SLOW_TICK {
                 tracing::info!(tick_ms = tick_elapsed.as_millis() as u64, "trage tik");
@@ -260,7 +287,11 @@ impl Pipeline {
                     tray.set(TrayState::Error);
                 }
             } else if let Some(tray) = &self.tray {
-                tray.set(if sleeping { TrayState::Idle } else { TrayState::Recording });
+                tray.set(if sleeping {
+                    TrayState::Idle
+                } else {
+                    TrayState::Recording
+                });
             }
 
             let interval = if sleeping {
@@ -333,8 +364,7 @@ impl Pipeline {
             self.filter
                 .gate(window.as_ref(), idle, self.cfg.capture.idle_after_secs)
         {
-            self.db
-                .record_skip(&now.format("%Y-%m-%d").to_string(), reason.as_str())?;
+            self.record_skip(&now.format("%Y-%m-%d").to_string(), reason.as_str())?;
             // Een lopend segment eindigt zodra je iets anders gaat doen.
             self.segment = None;
             return Ok(());
@@ -344,8 +374,7 @@ impl Pipeline {
         let app_key = window.app_key();
 
         if let Some(reason) = self.excluded_reason(&window, &app_key)? {
-            self.db
-                .record_skip(&now.format("%Y-%m-%d").to_string(), reason)?;
+            self.record_skip(&now.format("%Y-%m-%d").to_string(), reason)?;
             self.segment = None;
             return Ok(());
         }
@@ -379,6 +408,10 @@ impl Pipeline {
                 app = app_key,
                 "voorgrondvenster wisselde tijdens screenshot, tik overgeslagen"
             );
+            self.record_skip(
+                &now.format("%Y-%m-%d").to_string(),
+                "voorgrondvenster gewijzigd",
+            )?;
             return Ok(());
         }
 
@@ -420,18 +453,18 @@ impl Pipeline {
 
             let password_found = self
                 .process_frame(
-                FrameContext {
-                    segment_id,
-                    app_key: &app_key,
-                    title: &window.title,
-                    hwnd: window.hwnd,
-                    monitor: &shot.monitor,
-                    ts,
-                    now: &now,
-                },
-                image,
-            )
-            .await?;
+                    FrameContext {
+                        segment_id,
+                        app_key: &app_key,
+                        title: &window.title,
+                        hwnd: window.hwnd,
+                        monitor: &shot.monitor,
+                        ts,
+                        now: &now,
+                    },
+                    image,
+                )
+                .await?;
             if password_found {
                 // Geen tweede scherm van dit venster meer lezen.
                 break;
@@ -444,40 +477,73 @@ impl Pipeline {
         Ok(())
     }
 
-    async fn process_frame(
-        &mut self,
-        ctx: FrameContext<'_>,
-        image: RgbaImage,
-    ) -> Result<bool> {
-        let FrameContext {
-            segment_id,
-            app_key,
-            title,
-            hwnd,
-            monitor,
-            ts,
-            now,
-        } = ctx;
-        let day = now.format("%Y-%m-%d").to_string();
-
-        // Laag 2: is er iets veranderd op dit scherm?
-        let hash = block_in_place(|| dedupe::dhash(&image));
-        let scope = format!("{app_key}@{monitor}");
-        if self.filter.frame_is_duplicate(&scope, hash) {
-            self.db.touch_segment(segment_id, ts)?;
-            self.db.record_skip(&day, "onveranderd beeld")?;
+    async fn process_frame(&mut self, ctx: FrameContext<'_>, image: RgbaImage) -> Result<bool> {
+        let Some(hash) = self.check_frame_duplicate(&ctx, &image)? else {
             return Ok(false);
-        }
+        };
 
         // Laag 3: lezen wat er staat — eerst de accessibility-boom, dan OCR.
         // Bij meerdere monitoren wordt UIA bewust niet op een willekeurig
         // scherm toegepast: het beschrijft alleen het voorgrondvenster.
         let single_monitor = self.capturer.is_single_monitor();
         let read = if single_monitor {
-            self.read_text(app_key, hwnd, &image).await
+            self.read_text(ctx.app_key, ctx.hwnd, &image).await
         } else {
             self.read_ocr(&image, None).await
         };
+        self.process_frame_content(ctx, image, hash, read, single_monitor)
+    }
+
+    /// Zelfde framepad als productie, met een tekstuitkomst die tests kunnen
+    /// aanleveren zonder UIA/OCR of een echte desktop te starten.
+    #[cfg(test)]
+    fn process_frame_with_read(
+        &mut self,
+        ctx: FrameContext<'_>,
+        image: RgbaImage,
+        read: TextRead,
+        single_monitor: bool,
+    ) -> Result<bool> {
+        let Some(hash) = self.check_frame_duplicate(&ctx, &image)? else {
+            return Ok(false);
+        };
+        self.process_frame_content(ctx, image, hash, read, single_monitor)
+    }
+
+    fn check_frame_duplicate(
+        &mut self,
+        ctx: &FrameContext<'_>,
+        image: &RgbaImage,
+    ) -> Result<Option<u64>> {
+        let hash = block_in_place(|| dedupe::dhash(image));
+        let scope = format!("{}@{}", ctx.app_key, ctx.monitor);
+        if self.filter.frame_is_duplicate(&scope, hash) {
+            self.db.touch_segment(ctx.segment_id, ctx.ts)?;
+            self.record_skip(&ctx.now.format("%Y-%m-%d").to_string(), "onveranderd beeld")?;
+            return Ok(None);
+        }
+        Ok(Some(hash))
+    }
+
+    fn process_frame_content(
+        &mut self,
+        ctx: FrameContext<'_>,
+        image: RgbaImage,
+        hash: u64,
+        read: TextRead,
+        single_monitor: bool,
+    ) -> Result<bool> {
+        let FrameContext {
+            segment_id,
+            app_key,
+            title,
+            monitor,
+            ts,
+            now,
+            ..
+        } = ctx;
+        let day = now.format("%Y-%m-%d").to_string();
+        let scope = format!("{app_key}@{monitor}");
         if read.password {
             self.exclude_after_password(app_key, title, &day, segment_id)?;
             return Ok(true);
@@ -492,7 +558,7 @@ impl Pipeline {
         // video in een hoek), maar inhoudelijk is er niets nieuws.
         if analysis.same_as_previous {
             self.db.touch_segment(segment_id, ts)?;
-            self.db.record_skip(&day, "zelfde tekst")?;
+            self.record_skip(&day, "zelfde tekst")?;
             return Ok(false);
         }
 
@@ -554,7 +620,7 @@ impl Pipeline {
         // legt dan nog steeds vast dát je hier was.
         if kind == "image" && frame.is_none() {
             self.db.touch_segment(segment_id, ts)?;
-            self.db.record_skip(&day, "geen bruikbare inhoud")?;
+            self.record_skip(&day, "geen bruikbare inhoud")?;
             return Ok(false);
         }
 
@@ -674,11 +740,18 @@ impl Pipeline {
 
     /// Is dit venster (of deze site) uitgesloten? Leert ook: meldt de extensie
     /// een wachtwoordveld, dan wordt het hele domein vanaf nu uitgesloten.
-    fn excluded_reason(&mut self, window: &WindowInfo, app_key: &str) -> Result<Option<&'static str>> {
+    fn excluded_reason(
+        &mut self,
+        window: &WindowInfo,
+        app_key: &str,
+    ) -> Result<Option<&'static str>> {
         if self.db.is_excluded("app", app_key)? {
             return Ok(Some("app uitgesloten"));
         }
-        if self.db.is_excluded("window", &window_key(app_key, &window.title))? {
+        if self
+            .db
+            .is_excluded("window", &window_key(app_key, &window.title))?
+        {
             return Ok(Some("venster uitgesloten"));
         }
         if let Some((host, has_password_field)) = self.browser_report(app_key) {
@@ -686,11 +759,16 @@ impl Pipeline {
                 return Ok(Some("domein uitgesloten"));
             }
             if has_password_field {
-                if self
-                    .db
-                    .mark_excluded("domain", &host, "password_field", Local::now().timestamp())?
-                {
-                    tracing::warn!(domein = host, "domein uitgesloten (wachtwoordveld in de pagina)");
+                if self.db.mark_excluded(
+                    "domain",
+                    &host,
+                    "password_field",
+                    Local::now().timestamp(),
+                )? {
+                    tracing::warn!(
+                        domein = host,
+                        "domein uitgesloten (wachtwoordveld in de pagina)"
+                    );
                 }
                 return Ok(Some("domein uitgesloten"));
             }
@@ -711,20 +789,37 @@ impl Pipeline {
         let now = Local::now().timestamp();
         match self.browser_report(app_key) {
             Some((host, _)) => {
-                if self.db.mark_excluded("domain", &host, "password_field", now)? {
+                if self
+                    .db
+                    .mark_excluded("domain", &host, "password_field", now)?
+                {
                     tracing::warn!(domein = host, "domein uitgesloten (wachtwoordveld via uia)");
                 }
             }
             None => {
                 let key = window_key(app_key, title);
-                if self.db.mark_excluded("window", &key, "password_field", now)? {
-                    tracing::warn!(venster = key, "venster uitgesloten (wachtwoordveld via uia)");
+                if self
+                    .db
+                    .mark_excluded("window", &key, "password_field", now)?
+                {
+                    tracing::warn!(
+                        venster = key,
+                        "venster uitgesloten (wachtwoordveld via uia)"
+                    );
                 }
             }
         }
-        self.db.record_skip(day, "wachtwoordveld")?;
+        self.record_skip(day, "wachtwoordveld")?;
         self.db.discard_segment_if_empty(segment_id)?;
         self.segment = None;
+        Ok(())
+    }
+
+    fn record_skip(&self, day: &str, reason: &str) -> Result<()> {
+        self.db.record_skip(day, reason)?;
+        if let Some(status) = &self.status {
+            crate::server::record_skip_reason(status, reason);
+        }
         Ok(())
     }
 
@@ -855,6 +950,196 @@ mod tests {
             right,
             bottom,
         }
+    }
+
+    fn pipeline_fixture(
+        cfg: Config,
+    ) -> (Pipeline, Arc<Db>, Arc<FrameStore>, tempfile::TempDir, i64) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let app_id = db.app_id("test-app", "test.exe", "C:\\test.exe").unwrap();
+        let now = Local::now().timestamp();
+        let segment_id = db.open_segment(app_id, "Test window", now).unwrap();
+        let frames = Arc::new(FrameStore::new(
+            temp.path().to_path_buf(),
+            cfg.storage.frame_quality,
+            cfg.storage.frame_max_width,
+        ));
+        let pipeline = Pipeline::for_test(cfg, Arc::clone(&db), Arc::clone(&frames)).unwrap();
+        (pipeline, db, frames, temp, segment_id)
+    }
+
+    fn patterned_image(reverse: bool) -> RgbaImage {
+        RgbaImage::from_fn(9, 8, |x, _| {
+            let is_white = (x >= 4) ^ reverse;
+            let value = if is_white { 255 } else { 0 };
+            Rgba([value, value, value, 255])
+        })
+    }
+
+    fn frame_context<'a>(now: &'a chrono::DateTime<Local>, segment_id: i64) -> FrameContext<'a> {
+        FrameContext {
+            segment_id,
+            app_key: "test-app",
+            title: "Test window",
+            hwnd: 1,
+            monitor: "primary",
+            ts: now.timestamp(),
+            now,
+        }
+    }
+
+    fn uia_read(lines: &[&str]) -> TextRead {
+        TextRead {
+            lines: lines.iter().map(|line| (*line).to_string()).collect(),
+            source: Source::Uia,
+            note: None,
+            password: false,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gelijk_frame_wordt_overgeslagen_voor_tekstverwerking() {
+        let (mut pipeline, db, _, _temp, segment_id) = pipeline_fixture(Config::default());
+        let now = Local::now();
+        let img = patterned_image(false);
+
+        pipeline
+            .process_frame_with_read(
+                frame_context(&now, segment_id),
+                img.clone(),
+                uia_read(&["Eerste inhoud van het testvenster met voldoende tekst"]),
+                true,
+            )
+            .unwrap();
+        pipeline
+            .process_frame_with_read(
+                frame_context(&now, segment_id),
+                img,
+                uia_read(&["Andere tekst die door deduplicatie niet wordt verwerkt"]),
+                true,
+            )
+            .unwrap();
+
+        let stats = db.stats(0, i64::MAX).unwrap();
+        assert_eq!(stats.captures, 1);
+        assert!(
+            stats
+                .skipped
+                .iter()
+                .any(|(reason, count)| { reason == "onveranderd beeld" && *count == 1 })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wachtwoordveld_sluit_venster_uit_zonder_capture() {
+        let (mut pipeline, db, _, _temp, segment_id) = pipeline_fixture(Config::default());
+        let now = Local::now();
+        let read = TextRead {
+            lines: Vec::new(),
+            source: Source::Uia,
+            note: None,
+            password: true,
+        };
+
+        let password_found = pipeline
+            .process_frame_with_read(
+                frame_context(&now, segment_id),
+                patterned_image(false),
+                read,
+                true,
+            )
+            .unwrap();
+
+        assert!(password_found);
+        assert_eq!(db.stats(0, i64::MAX).unwrap().captures, 0);
+        assert!(db.is_excluded("window", "test-app::Test window").unwrap());
+        assert!(
+            db.stats(0, i64::MAX)
+                .unwrap()
+                .skipped
+                .iter()
+                .any(|(reason, count)| reason == "wachtwoordveld" && *count == 1)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn geen_tekst_bewaart_beeld_als_fallback() {
+        let (mut pipeline, db, frames, _temp, segment_id) = pipeline_fixture(Config::default());
+        let now = Local::now();
+        let read = TextRead {
+            lines: Vec::new(),
+            source: Source::None,
+            note: Some("geen tekstbron".into()),
+            password: false,
+        };
+
+        pipeline
+            .process_frame_with_read(
+                frame_context(&now, segment_id),
+                patterned_image(false),
+                read,
+                true,
+            )
+            .unwrap();
+
+        let capture = db.capture(1).unwrap().unwrap();
+        assert_eq!(capture.kind, "image");
+        let path = db.frame_path(1).unwrap().unwrap();
+        assert!(capture.has_frame);
+        assert!(!frames.read(&path).unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn boilerplate_blijft_in_capturetekst_maar_niet_in_fts() {
+        let mut cfg = Config::default();
+        cfg.filter.boilerplate_min_frames = 1;
+        cfg.filter.boilerplate_ratio = 1.0;
+        cfg.ocr.min_text_len = 8;
+        let (mut pipeline, db, _, _temp, segment_id) = pipeline_fixture(cfg);
+        let now = Local::now();
+
+        pipeline
+            .process_frame_with_read(
+                frame_context(&now, segment_id),
+                patterned_image(false),
+                uia_read(&[
+                    "Persistent toolbar common navigation controls",
+                    "First distinct application content for the initial frame",
+                ]),
+                true,
+            )
+            .unwrap();
+        pipeline
+            .process_frame_with_read(
+                frame_context(&now, segment_id),
+                patterned_image(true),
+                uia_read(&[
+                    "Persistent toolbar common navigation controls",
+                    "Second unique application content for another frame",
+                ]),
+                true,
+            )
+            .unwrap();
+
+        let second = db.capture(2).unwrap().unwrap();
+        assert!(
+            second
+                .text
+                .contains("Persistent toolbar common navigation controls")
+        );
+
+        let hits = db
+            .search(&crate::store::SearchQuery {
+                text: "Persistent toolbar common navigation controls".into(),
+                from: Some(0),
+                to: Some(i64::MAX),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 1);
     }
 
     #[test]

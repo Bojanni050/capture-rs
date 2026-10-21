@@ -5,7 +5,7 @@
 //! losgekoppeld, resolutie gewijzigd) verversen we de cache en proberen we
 //! het één keer opnieuw.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use image::RgbaImage;
 use xcap::Monitor;
 
@@ -32,6 +32,14 @@ pub struct Shot {
 }
 
 impl ScreenCapturer {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            selector: MonitorSelector::Primary,
+            monitors: Vec::new(),
+        }
+    }
+
     /// `spec` is "primary", "all" of een index als tekst ("0", "1", ...).
     pub fn new(spec: &str) -> Result<Self> {
         let selector = match spec.trim().to_lowercase().as_str() {

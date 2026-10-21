@@ -97,11 +97,17 @@ enum Command {
         /// Gebruik semantische (embedding) zoek in plaats van exact FTS5.
         #[arg(long)]
         semantic: bool,
+        /// Geef alleen machineleesbare JSON terug.
+        #[arg(long)]
+        json: bool,
     },
     /// Samenvatting van wat er is vastgelegd en weggefilterd.
     Stats {
         #[arg(long, default_value = "7d")]
         since: String,
+        /// Geef alleen machineleesbare JSON terug.
+        #[arg(long)]
+        json: bool,
     },
     /// Ruim oude gegevens op volgens het retentiebeleid.
     Purge {
@@ -241,14 +247,23 @@ async fn main() -> Result<()> {
             limit,
             full,
             semantic,
+            json,
         } => {
             if semantic {
-                cmd_search_semantic(cfg, query.join(" "), app, &since, limit).await
+                cmd_search_semantic(cfg, query.join(" "), app, &since, limit, json).await
             } else {
-                cmd_search(cfg, query.join(" "), app, kind, &since, limit, full)
+                cmd_search(
+                    cfg,
+                    query.join(" "),
+                    app,
+                    kind,
+                    &since,
+                    limit,
+                    SearchOutput { full, json },
+                )
             }
         }
-        Command::Stats { since } => cmd_stats(cfg, &since),
+        Command::Stats { since, json } => cmd_stats(cfg, &since, json),
         Command::Purge {
             older_than,
             frames_older_than,
@@ -516,6 +531,12 @@ async fn cmd_serve(cfg: Config, logs: logs::LogBuffer) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct SearchOutput {
+    full: bool,
+    json: bool,
+}
+
 fn cmd_search(
     cfg: Config,
     query: String,
@@ -523,10 +544,14 @@ fn cmd_search(
     kind: Option<String>,
     since: &str,
     limit: i64,
-    full: bool,
+    output: SearchOutput,
 ) -> Result<()> {
+    let SearchOutput { full, json } = output;
     let (db, _frames) = open_store(&cfg)?;
     let from = Local::now().timestamp() - parse_duration(since)?;
+    let query_text = query.clone();
+    let app_filter = app.clone();
+    let kind_filter = kind.clone();
 
     let hits = db.search(&SearchQuery {
         text: query,
@@ -537,6 +562,35 @@ fn cmd_search(
         limit,
         offset: 0,
     })?;
+
+    if json {
+        let results = hits
+            .iter()
+            .map(|hit| {
+                let mut value = serde_json::to_value(hit)?;
+                if full {
+                    let full_text = db
+                        .capture(hit.id)?
+                        .map(|capture| capture.text)
+                        .unwrap_or_default();
+                    value
+                        .as_object_mut()
+                        .expect("SearchHit serialiseert als object")
+                        .insert("full_text".into(), serde_json::Value::String(full_text));
+                }
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        print_json(&serde_json::json!({
+            "query": query_text,
+            "app": app_filter,
+            "kind": kind_filter,
+            "since": since,
+            "count": results.len(),
+            "results": results,
+        }))?;
+        return Ok(());
+    }
 
     if hits.is_empty() {
         println!("Niets gevonden.");
@@ -577,11 +631,21 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_stats(cfg: Config, since: &str) -> Result<()> {
+fn cmd_stats(cfg: Config, since: &str, json: bool) -> Result<()> {
     let (db, frames) = open_store(&cfg)?;
     let now = Local::now().timestamp();
     let from = now - parse_duration(since)?;
     let s = db.stats(from, now)?;
+    let frame_disk_usage_bytes = frames.disk_usage();
+
+    if json {
+        print_json(&serde_json::json!({
+            "period": { "since": since, "from": from, "to": now },
+            "frame_disk_usage_bytes": frame_disk_usage_bytes,
+            "stats": s,
+        }))?;
+        return Ok(());
+    }
 
     println!("Periode          laatste {since}");
     println!("Vastgelegd       {}", s.captures);
@@ -600,7 +664,7 @@ fn cmd_stats(cfg: Config, since: &str) -> Result<()> {
     println!(
         "Frames           {} bestanden, {:.1} MB",
         s.frames_on_disk,
-        frames.disk_usage() as f64 / 1_048_576.0
+        frame_disk_usage_bytes as f64 / 1_048_576.0
     );
 
     if let (Some(first), Some(last)) = (s.first_ts, s.last_ts) {
@@ -1037,17 +1101,37 @@ async fn cmd_search_semantic(
     app: Option<String>,
     since: &str,
     limit: i64,
+    json: bool,
 ) -> Result<()> {
     if query.trim().is_empty() {
-        println!("Geef een zoekterm op voor semantisch zoeken.");
+        if json {
+            print_json(&serde_json::json!({
+                "query": query,
+                "since": since,
+                "count": 0,
+                "results": [],
+            }))?;
+        } else {
+            println!("Geef een zoekterm op voor semantisch zoeken.");
+        }
         return Ok(());
     }
     if !cfg.embeddings.enabled {
-        println!("Semantisch zoeken is uitgeschakeld (embeddings.enabled = false).");
-        println!(
-            "Zet het aan in {} of via --config.",
-            Config::default_path()?.display()
-        );
+        if json {
+            print_json(&serde_json::json!({
+                "query": query,
+                "since": since,
+                "count": 0,
+                "results": [],
+                "error": "semantisch zoeken is uitgeschakeld",
+            }))?;
+        } else {
+            println!("Semantisch zoeken is uitgeschakeld (embeddings.enabled = false).");
+            println!(
+                "Zet het aan in {} of via --config.",
+                Config::default_path()?.display()
+            );
+        }
         return Ok(());
     }
     let store = embeddings::make_store(&cfg);
@@ -1055,8 +1139,18 @@ async fn cmd_search_semantic(
 
     // Check beschikbaarheid
     if let Err(e) = store.ensure_schema().await {
-        println!("Vector store niet beschikbaar: {e}");
-        println!("Controleer postgres_url en of pgvector geïnstalleerd is.");
+        if json {
+            print_json(&serde_json::json!({
+                "query": query,
+                "since": since,
+                "count": 0,
+                "results": [],
+                "error": e.to_string(),
+            }))?;
+        } else {
+            println!("Vector store niet beschikbaar: {e}");
+            println!("Controleer postgres_url en of pgvector geïnstalleerd is.");
+        }
         return Ok(());
     }
 
@@ -1072,17 +1166,48 @@ async fn cmd_search_semantic(
     .map_err(|e| anyhow!("embed task panicked: {e}"))??;
 
     let hits = store.search(q_emb, limit.max(1) as usize).await?;
+    let hits: Vec<_> = hits
+        .iter()
+        .filter(|h| app.as_deref().is_none_or(|a| h.document.application == a))
+        .filter(|h| h.document.start_time >= from)
+        .take(limit.max(1) as usize)
+        .collect();
+
+    if json {
+        let results = hits
+            .iter()
+            .map(|hit| {
+                let mut value = serde_json::to_value(hit)?;
+                if let Some(first_id) = hit.document.source_capture_ids.first() {
+                    value
+                        .as_object_mut()
+                        .expect("SemanticHit serialiseert als object")
+                        .insert(
+                            "capture_url".into(),
+                            serde_json::Value::String(format!(
+                                "http://{}:{}/#{}",
+                                cfg.server.bind, cfg.server.port, first_id
+                            )),
+                        );
+                }
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        print_json(&serde_json::json!({
+            "query": query,
+            "since": since,
+            "count": results.len(),
+            "results": results,
+        }))?;
+        return Ok(());
+    }
+
     if hits.is_empty() {
         println!("Niets gevonden (semantisch).");
         return Ok(());
     }
     let color = std::io::stdout().is_terminal();
-    for hit in hits
-        .iter()
-        .filter(|h| app.as_deref().is_none_or(|a| h.document.application == a))
-        .filter(|h| h.document.start_time >= from)
-        .take(limit as usize)
-    {
+    for hit in hits {
         let when = Local
             .timestamp_opt(hit.document.start_time, 0)
             .single()
@@ -1113,6 +1238,11 @@ async fn cmd_search_semantic(
                 .join(",")
         );
     }
+    Ok(())
+}
+
+fn print_json(value: &impl serde::Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 
@@ -1333,6 +1463,31 @@ mod tests {
     fn afkappen_telt_in_tekens_niet_bytes() {
         assert_eq!(truncate("hallo", 10), "hallo");
         assert_eq!(truncate("café-avond", 4), "café…");
+    }
+
+    #[test]
+    fn search_en_stats_accepteren_json_vlag() {
+        let cli = Cli::try_parse_from([
+            "capture",
+            "search",
+            "--json",
+            "--full",
+            "--semantic",
+            "voorbeelden",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Search {
+                json: true,
+                full: true,
+                semantic: true,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["capture", "stats", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Stats { json: true, .. }));
     }
 
     #[test]

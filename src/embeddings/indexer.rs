@@ -6,7 +6,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::embeddings::document::{CaptureRow, SemanticDocument, build_documents};
+use crate::embeddings::document::{CaptureRow, build_documents};
 use crate::embeddings::provider::EmbeddingProvider;
 use crate::embeddings::store::VectorStore;
 use crate::store::Db;
@@ -57,17 +57,13 @@ impl Indexer {
             tracing::warn!(error = %e, "vector store schema niet beschikbaar — semantic indexing pending");
         }
 
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs_f64(self.cfg.embeddings.poll_interval_secs.max(1.0)));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs_f64(
+            self.cfg.embeddings.poll_interval_secs.max(1.0),
+        ));
         // Sla eerste tick over
         interval.tick().await;
 
-        // Duurzaam vanaf hier verder, niet vanaf 0: zonder dit herembedde elke
-        // herstart de hele geschiedenis in batches van 500 rijen.
-        let db = Arc::clone(&self.db);
-        let mut last_seen_id: i64 = tokio::task::spawn_blocking(move || db.load_embeddings_cursor())
-            .await
-            .map_err(|e| anyhow::anyhow!("cursor lezen panicked: {e}"))??;
+        let mut last_seen_id = self.initial_cursor().await?;
 
         loop {
             tokio::select! {
@@ -145,13 +141,28 @@ impl Indexer {
         Ok(n)
     }
 
-    /// Werkt de cursor bij in het geheugen én in SQLite, in die volgorde: pas
-    /// als de opslag lukt telt de voortgang als definitief.
-    async fn commit_cursor(&self, last_seen: &mut i64, advanced_to: i64) -> Result<()> {
+    async fn initial_cursor(&self) -> Result<i64> {
+        if !self.store.is_durable() {
+            // In-memory documenten verdwijnen bij afsluiten; de proceslokale
+            // index moet daarom altijd opnieuw vanaf de oudste capture beginnen.
+            return Ok(0);
+        }
+
         let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || db.save_embeddings_cursor(advanced_to))
+        tokio::task::spawn_blocking(move || db.load_embeddings_cursor())
             .await
-            .map_err(|e| anyhow::anyhow!("cursor opslaan panicked: {e}"))??;
+            .map_err(|e| anyhow::anyhow!("cursor lezen panicked: {e}"))?
+    }
+
+    /// Werkt de cursor bij. Alleen een duurzame vector store mag de voortgang
+    /// in SQLite bewaren; vluchtige stores beginnen na een restart opnieuw.
+    async fn commit_cursor(&self, last_seen: &mut i64, advanced_to: i64) -> Result<()> {
+        if self.store.is_durable() {
+            let db = Arc::clone(&self.db);
+            tokio::task::spawn_blocking(move || db.save_embeddings_cursor(advanced_to))
+                .await
+                .map_err(|e| anyhow::anyhow!("cursor opslaan panicked: {e}"))??;
+        }
         *last_seen = advanced_to;
         Ok(())
     }
@@ -160,4 +171,64 @@ impl Indexer {
 // Helper: lees captures sinds id, alleen `text` soort en met index_text niet leeg.
 fn fetch_since(db: &Db, since_id: i64) -> Result<Vec<CaptureRow>> {
     db.fetch_captures_since(since_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embeddings::provider::MockProvider;
+    use crate::embeddings::store::InMemoryStore;
+    use crate::store::NewCapture;
+
+    #[tokio::test]
+    async fn in_memory_indexer_herindexeert_na_restart_en_bewaart_geen_cursor() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        db.save_embeddings_cursor(99).unwrap();
+        let app_id = db.app_id("editor", "editor.exe", "").unwrap();
+        let segment_id = db.open_segment(app_id, "project", 1_700_000_000).unwrap();
+        let text = "Dit is een voldoende lange tekstregel om een semantisch document te maken.";
+        db.insert_capture(NewCapture {
+            segment_id,
+            ts: 1_700_000_000,
+            kind: "text",
+            source: "uia",
+            monitor: "primary",
+            phash: 0,
+            quality: 1.0,
+            text,
+            index_text: text,
+            frame_path: None,
+            width: 100,
+            height: 100,
+            fallback_reason: None,
+        })
+        .unwrap();
+
+        let store = Arc::new(InMemoryStore::new());
+        let indexer = Indexer::new(
+            Config::default(),
+            Arc::clone(&db),
+            store.clone(),
+            Arc::new(MockProvider::default()),
+            None,
+        );
+
+        let mut cursor = indexer.initial_cursor().await.unwrap();
+        assert_eq!(cursor, 0, "volatile store mag oude cursor niet vertrouwen");
+        indexer.tick_once(&mut cursor).await.unwrap();
+        assert_eq!(store.count().await.unwrap(), 1);
+        assert_eq!(cursor, 1);
+        assert_eq!(db.load_embeddings_cursor().unwrap(), 99);
+
+        // Een nieuwe indexer met een lege RAM-store moet dezelfde historie
+        // opnieuw ophalen, ook al staat SQLite nog op een hogere cursor.
+        let restarted = Indexer::new(
+            Config::default(),
+            db,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(MockProvider::default()),
+            None,
+        );
+        assert_eq!(restarted.initial_cursor().await.unwrap(), 0);
+    }
 }
