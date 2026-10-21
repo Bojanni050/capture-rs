@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        # The repository has pre-existing rustfmt drift in unrelated modules.
+        # Check the Rust files changed by this work without reformatting the baseline.
+        run: rustfmt --check --edition 2024 --config skip_children=true src/main.rs src/store/db.rs
+      - name: Run Clippy
+        run: cargo clippy --all-targets
+      - name: Run tests
+        run: cargo test --release

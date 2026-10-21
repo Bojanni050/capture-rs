@@ -20,14 +20,17 @@ mod store;
 mod tray;
 mod uia;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
 use config::Config;
 use std::io::IsTerminal;
+use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use store::{Db, FrameStore, SearchQuery};
+use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+use windows::core::PCWSTR;
 
 #[derive(Parser)]
 #[command(
@@ -214,7 +217,13 @@ async fn main() -> Result<()> {
     let (cfg, cfg_path) = Config::load(cli.config.as_deref())?;
 
     match cli.command {
-        Command::Start { no_server, tray, no_tray, hide_console, show_console } => {
+        Command::Start {
+            no_server,
+            tray,
+            no_tray,
+            hide_console,
+            show_console,
+        } => {
             // Tray en een losgekoppelde console zijn de standaard: Capture hoort op
             // de achtergrond te leven, met het icoon als bediening en de
             // webinterface als status. `--tray`/`--hide-console` bestaan nog
@@ -250,8 +259,12 @@ async fn main() -> Result<()> {
         Command::Config { init } => cmd_config(cfg, &cfg_path, init),
         Command::Embeddings { action } => match action {
             EmbeddingsCommand::Status => cmd_embeddings_status(cfg).await,
-            EmbeddingsCommand::Rebuild { since, limit } => cmd_embeddings_rebuild(cfg, &since, limit).await,
-            EmbeddingsCommand::Purge { older_than, yes } => cmd_embeddings_purge(cfg, older_than, yes).await,
+            EmbeddingsCommand::Rebuild { since, limit } => {
+                cmd_embeddings_rebuild(cfg, &since, limit).await
+            }
+            EmbeddingsCommand::Purge { older_than, yes } => {
+                cmd_embeddings_purge(cfg, older_than, yes).await
+            }
         },
         Command::Autostart { action } => cmd_autostart(action),
         Command::Exclude { action } => cmd_exclude(cfg, action),
@@ -388,13 +401,7 @@ async fn cmd_start(
     let indexer_handle = if cfg.embeddings.enabled {
         let store = embeddings_store.clone().expect("enabled");
         let provider = embeddings_provider.clone().expect("enabled");
-        let indexer = embeddings::Indexer::new(
-            cfg.clone(),
-            Arc::clone(&db),
-            store,
-            provider,
-            None,
-        );
+        let indexer = embeddings::Indexer::new(cfg.clone(), Arc::clone(&db), store, provider, None);
         let (idx_tx, idx_rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(async move {
             if let Err(e) = indexer.run(idx_rx).await {
@@ -561,7 +568,10 @@ fn cmd_search(
             hit.snippet.clone()
         };
         println!("  {}", markeer(&body, color).replace('\n', "\n  "));
-        println!("  \u{2192} http://{}:{}/#{}", cfg.server.bind, cfg.server.port, hit.id);
+        println!(
+            "  \u{2192} http://{}:{}/#{}",
+            cfg.server.bind, cfg.server.port, hit.id
+        );
     }
     println!("\n{} resultaten.", hits.len());
     Ok(())
@@ -594,11 +604,7 @@ fn cmd_stats(cfg: Config, since: &str) -> Result<()> {
     );
 
     if let (Some(first), Some(last)) = (s.first_ts, s.last_ts) {
-        println!(
-            "Bereik           {} tot {}",
-            fmt_ts(first),
-            fmt_ts(last)
-        );
+        println!("Bereik           {} tot {}", fmt_ts(first), fmt_ts(last));
     }
 
     if !s.top_apps.is_empty() {
@@ -657,7 +663,10 @@ async fn cmd_purge(
             println!("  {n_captures} captures van vóór {}", fmt_ts(cutoff));
         }
         if let Some(cutoff) = frames_before {
-            println!("  {n_frames} afbeeldingen van vóór {} (tekst blijft)", fmt_ts(cutoff));
+            println!(
+                "  {n_frames} afbeeldingen van vóór {} (tekst blijft)",
+                fmt_ts(cutoff)
+            );
         }
         println!("\nVoeg --yes toe om het echt te doen.");
         return Ok(());
@@ -683,7 +692,7 @@ async fn cmd_purge(
             let store = embeddings::make_store(&cfg);
             match store.delete_before(cutoff).await {
                 Ok(n) if n > 0 => println!("{n} semantische documenten verwijderd."),
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "semantic purge faalde — PG unavailable?"),
             }
         }
@@ -707,11 +716,34 @@ fn cmd_doctor(cfg: Config, cfg_path: &std::path::Path) -> Result<()> {
 
     let db_path = cfg.db_path()?;
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-    println!("Database         {} ({:.1} MB)", db_path.display(), db_size as f64 / 1_048_576.0);
+    println!(
+        "Database         {} ({:.1} MB)",
+        db_path.display(),
+        db_size as f64 / 1_048_576.0
+    );
 
-    match Db::open(&db_path) {
-        Ok(_) => println!("                 schema in orde, FTS5 beschikbaar"),
-        Err(e) => println!("  !! database:   {e}"),
+    let db = match Db::open(&db_path) {
+        Ok(db) => {
+            println!("                 schema in orde, FTS5 beschikbaar");
+            match db.integrity_check() {
+                Ok(()) => println!("Integriteit       ok"),
+                Err(e) => println!("  !! integriteit: {e}"),
+            }
+            Some(db)
+        }
+        Err(e) => {
+            println!("  !! database:   {e}");
+            None
+        }
+    };
+
+    match disk_space(&data_dir) {
+        Ok((available, total)) => println!(
+            "Vrije ruimte     {:.1} GB beschikbaar van {:.1} GB",
+            available as f64 / 1_000_000_000.0,
+            total as f64 / 1_000_000_000.0
+        ),
+        Err(e) => println!("  !! opslag:     vrije ruimte niet uitleesbaar: {e}"),
     }
 
     println!();
@@ -727,15 +759,25 @@ fn cmd_doctor(cfg: Config, cfg_path: &std::path::Path) -> Result<()> {
     println!("Inactief sinds   {} s", capture::idle_seconds());
 
     println!();
-    let excluded = Db::open(&db_path).and_then(|db| db.list_excluded()).map(|l| l.len());
+    let excluded = db
+        .as_ref()
+        .ok_or_else(|| anyhow!("database niet beschikbaar"))
+        .and_then(|db| db.list_excluded())
+        .map(|list| list.len());
     println!(
         "Uitsluitingen    {}",
-        excluded.map_or_else(|e| format!("!! {e}"), |n| format!("{n} (zie `capture exclude list`)"))
+        excluded.map_or_else(
+            |e| format!("!! {e}"),
+            |n| format!("{n} (zie `capture exclude list`)")
+        )
     );
     println!(
         "Browser-bridge   {}",
         if cfg.browser.enabled {
-            format!("aan op 127.0.0.1:{} (extensie: browser-extension/)", cfg.browser.port)
+            format!(
+                "aan op 127.0.0.1:{} (extensie: browser-extension/)",
+                cfg.browser.port
+            )
         } else {
             "uit".to_string()
         }
@@ -746,7 +788,11 @@ fn cmd_doctor(cfg: Config, cfg_path: &std::path::Path) -> Result<()> {
             format!(
                 "aan → {} (token: {})",
                 cfg.ship.endpoint,
-                if cfg.ship.resolved_token().is_some() { "ingesteld" } else { "ONTBREEKT" }
+                if cfg.ship.resolved_token().is_some() {
+                    "ingesteld"
+                } else {
+                    "ONTBREEKT"
+                }
             )
         } else {
             "uit (alles blijft lokaal)".to_string()
@@ -775,6 +821,22 @@ fn cmd_doctor(cfg: Config, cfg_path: &std::path::Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Geeft vrije en totale ruimte terug voor het volume met de datamap.
+fn disk_space(path: &std::path::Path) -> Result<(u64, u64)> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut available = 0u64;
+    let mut total = 0u64;
+    unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(wide.as_ptr()),
+            Some(&mut available),
+            Some(&mut total),
+            None,
+        )?;
+    }
+    Ok((available, total))
 }
 
 /// Probeert UI Automation op elk open venster en rapporteert per app.
@@ -829,7 +891,13 @@ fn proef_uia(cfg: &Config) -> Result<()> {
                     oordeel,
                 )
             }
-            Err(_) => ("-".into(), "-".into(), "-".into(), "-".into(), "geen element -> ocr"),
+            Err(_) => (
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "geen element -> ocr",
+            ),
         };
 
         println!(
@@ -844,7 +912,10 @@ fn proef_uia(cfg: &Config) -> Result<()> {
 fn proefopname(cfg: &Config) -> Result<String> {
     let mut cap = capture::ScreenCapturer::new(&cfg.capture.monitor)?;
     let shots = cap.capture()?;
-    let shot = shots.into_iter().next().ok_or_else(|| anyhow!("geen frame"))?;
+    let shot = shots
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("geen frame"))?;
     let (w, h) = shot.image.dimensions();
 
     let engine = ocr::windows_ocr::WindowsOcr::new(cfg.ocr.language.as_deref())
@@ -885,7 +956,9 @@ fn cmd_config(cfg: Config, path: &std::path::Path, init: bool) -> Result<()> {
 
     println!("# {}", path.display());
     if !path.exists() {
-        println!("# (bestaat nog niet — dit zijn de defaults; `capture config --init` schrijft ze weg)");
+        println!(
+            "# (bestaat nog niet — dit zijn de defaults; `capture config --init` schrijft ze weg)"
+        );
     }
     println!("{}", toml::to_string_pretty(&cfg)?);
     Ok(())
@@ -912,14 +985,22 @@ fn cmd_exclude(cfg: Config, action: ExcludeCommand) -> Result<()> {
             let new = db.mark_excluded(&kind, &key, "manual", Local::now().timestamp())?;
             println!(
                 "{}",
-                if new { "Uitgesloten." } else { "Stond al op de lijst." }
+                if new {
+                    "Uitgesloten."
+                } else {
+                    "Stond al op de lijst."
+                }
             );
         }
         ExcludeCommand::Remove { kind, key } => {
             let removed = db.unexclude(&kind, &key)?;
             println!(
                 "{}",
-                if removed { "Uitsluiting opgeheven." } else { "Stond niet op de lijst." }
+                if removed {
+                    "Uitsluiting opgeheven."
+                } else {
+                    "Stond niet op de lijst."
+                }
             );
         }
     }
@@ -930,14 +1011,20 @@ fn cmd_autostart(action: AutostartCommand) -> Result<()> {
     match action {
         AutostartCommand::Enable => {
             autostart::enable()?;
-            println!("Capture start voortaan automatisch op bij het inloggen (met systemtray-icoon).");
+            println!(
+                "Capture start voortaan automatisch op bij het inloggen (met systemtray-icoon)."
+            );
         }
         AutostartCommand::Disable => {
             autostart::disable()?;
             println!("Automatisch opstarten uitgeschakeld.");
         }
         AutostartCommand::Status => {
-            let status = if autostart::is_enabled() { "aan" } else { "uit" };
+            let status = if autostart::is_enabled() {
+                "aan"
+            } else {
+                "uit"
+            };
             println!("Automatisch opstarten staat {status}.");
         }
     }
@@ -957,7 +1044,10 @@ async fn cmd_search_semantic(
     }
     if !cfg.embeddings.enabled {
         println!("Semantisch zoeken is uitgeschakeld (embeddings.enabled = false).");
-        println!("Zet het aan in {} of via --config.", Config::default_path()?.display());
+        println!(
+            "Zet het aan in {} of via --config.",
+            Config::default_path()?.display()
+        );
         return Ok(());
     }
     let store = embeddings::make_store(&cfg);
@@ -987,7 +1077,9 @@ async fn cmd_search_semantic(
         return Ok(());
     }
     let color = std::io::stdout().is_terminal();
-    for hit in hits.iter().filter(|h| app.as_deref().is_none_or(|a| h.document.application == a))
+    for hit in hits
+        .iter()
+        .filter(|h| app.as_deref().is_none_or(|a| h.document.application == a))
         .filter(|h| h.document.start_time >= from)
         .take(limit as usize)
     {
@@ -1006,9 +1098,20 @@ async fn cmd_search_semantic(
         let snippet = hit.snippet.replace('\n', "\n  ");
         println!("  {}", markeer(&snippet, color));
         if let Some(first) = hit.document.source_capture_ids.first() {
-            println!("  → http://{}:{}/#{}", cfg.server.bind, cfg.server.port, first);
+            println!(
+                "  → http://{}:{}/#{}",
+                cfg.server.bind, cfg.server.port, first
+            );
         }
-        println!("  provenance: {}", hit.document.source_capture_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","));
+        println!(
+            "  provenance: {}",
+            hit.document
+                .source_capture_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
     }
     Ok(())
 }
@@ -1018,7 +1121,8 @@ async fn cmd_embeddings_status(cfg: Config) -> Result<()> {
     println!("Provider (config): {}", cfg.embeddings.provider);
     println!(
         "Postgres: {}",
-        cfg.embeddings_postgres_url().unwrap_or_else(|| "(geen)".into())
+        cfg.embeddings_postgres_url()
+            .unwrap_or_else(|| "(geen)".into())
     );
     if !cfg.embeddings.enabled {
         println!("(uitgeschakeld — geen indexering)");
@@ -1073,10 +1177,18 @@ async fn cmd_embeddings_rebuild(cfg: Config, since: &str, limit: i64) -> Result<
     let filtered: Vec<_> = all
         .into_iter()
         .filter(|c| c.ts >= from)
-        .take(if limit > 0 { limit as usize } else { usize::MAX })
+        .take(if limit > 0 {
+            limit as usize
+        } else {
+            usize::MAX
+        })
         .collect();
 
-    println!("Gevonden {} captures sinds {}, bouw documenten...", filtered.len(), since);
+    println!(
+        "Gevonden {} captures sinds {}, bouw documenten...",
+        filtered.len(),
+        since
+    );
 
     let docs = embeddings::build_documents(
         &filtered,
@@ -1086,7 +1198,11 @@ async fn cmd_embeddings_rebuild(cfg: Config, since: &str, limit: i64) -> Result<
         provider.model_name(),
         provider.dimensions(),
     );
-    println!("Gebouwd {} semantic documents (dedup, window {}s)", docs.len(), cfg.embeddings.window_secs);
+    println!(
+        "Gebouwd {} semantic documents (dedup, window {}s)",
+        docs.len(),
+        cfg.embeddings.window_secs
+    );
     if docs.is_empty() {
         println!("Niets te indexeren.");
         return Ok(());
@@ -1113,11 +1229,17 @@ async fn cmd_embeddings_purge(cfg: Config, older_than: Option<String>, yes: bool
     let store = embeddings::make_store(&cfg);
     if !yes {
         let n = store.count().await.unwrap_or(0);
-        println!("Zou documenten verwijderen vóór {} (nu {n} docs). Voeg --yes toe.", fmt_ts(cutoff));
+        println!(
+            "Zou documenten verwijderen vóór {} (nu {n} docs). Voeg --yes toe.",
+            fmt_ts(cutoff)
+        );
         return Ok(());
     }
     let n = store.delete_before(cutoff).await?;
-    println!("{n} semantische documenten verwijderd vóór {}.", fmt_ts(cutoff));
+    println!(
+        "{n} semantische documenten verwijderd vóór {}.",
+        fmt_ts(cutoff)
+    );
     Ok(())
 }
 
@@ -1138,12 +1260,24 @@ fn parse_duration(spec: &str) -> Result<i64> {
         .with_context(|| format!("kan tijdsduur niet lezen: {spec}"))?;
 
     let secs = match unit.trim() {
-        "" | "d" => n.checked_mul(86_400).ok_or_else(|| anyhow!("tijdsduur te groot: {spec}"))?,
-        "h" => n.checked_mul(3_600).ok_or_else(|| anyhow!("tijdsduur te groot: {spec}"))?,
-        "m" => n.checked_mul(60).ok_or_else(|| anyhow!("tijdsduur te groot: {spec}"))?,
+        "" | "d" => n
+            .checked_mul(86_400)
+            .ok_or_else(|| anyhow!("tijdsduur te groot: {spec}"))?,
+        "h" => n
+            .checked_mul(3_600)
+            .ok_or_else(|| anyhow!("tijdsduur te groot: {spec}"))?,
+        "m" => n
+            .checked_mul(60)
+            .ok_or_else(|| anyhow!("tijdsduur te groot: {spec}"))?,
         "s" => n,
-        "w" => n.checked_mul(604_800).ok_or_else(|| anyhow!("tijdsduur te groot: {spec}"))?,
-        other => return Err(anyhow!("onbekende eenheid {other:?}; gebruik s, m, h, d of w")),
+        "w" => n
+            .checked_mul(604_800)
+            .ok_or_else(|| anyhow!("tijdsduur te groot: {spec}"))?,
+        other => {
+            return Err(anyhow!(
+                "onbekende eenheid {other:?}; gebruik s, m, h, d of w"
+            ));
+        }
     };
     Ok(secs)
 }
@@ -1204,10 +1338,16 @@ mod tests {
     #[test]
     fn tray_en_verborgen_console_zijn_standaard_aan() {
         // Kale `start`: allebei aan.
-        assert_eq!(resolve_start_flags(false, false, false, false), (true, true));
+        assert_eq!(
+            resolve_start_flags(false, false, false, false),
+            (true, true)
+        );
         // Legacy-vlaggen veranderen daar niets aan.
         assert_eq!(resolve_start_flags(true, false, true, false), (true, true));
         // Expliciet uitzetten wint.
-        assert_eq!(resolve_start_flags(false, true, false, true), (false, false));
+        assert_eq!(
+            resolve_start_flags(false, true, false, true),
+            (false, false)
+        );
     }
 }

@@ -5,15 +5,16 @@
 //! is dat ruim voldoende en het scheelt een connection pool.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const SCHEMA_VERSION: i32 = 4;
 
 pub struct Db {
     conn: Mutex<Connection>,
+    path: Option<PathBuf>,
 }
 
 /// Eén opgeslagen waarneming.
@@ -117,15 +118,15 @@ impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("database openen mislukt: {}", path.display()))?;
-        Self::from_connection(conn)
+        Self::from_connection(conn, Some(path))
     }
 
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(Connection::open_in_memory()?, None)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self> {
+    fn from_connection(conn: Connection, path: Option<&Path>) -> Result<Self> {
         // WAL houdt lezen (de webserver) en schrijven (de pipeline) uit elkaar.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -133,6 +134,7 @@ impl Db {
 
         let db = Self {
             conn: Mutex::new(conn),
+            path: path.map(Path::to_path_buf),
         };
         db.migrate()?;
         Ok(db)
@@ -143,6 +145,10 @@ impl Db {
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version >= SCHEMA_VERSION {
             return Ok(());
+        }
+
+        if let Some(path) = &self.path {
+            Self::backup_before_migration(&conn, path, version)?;
         }
 
         if version < 1 {
@@ -160,6 +166,63 @@ impl Db {
 
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
+    }
+
+    /// Bewaart een kopie van een bestaande database voordat het schema wordt
+    /// aangepast. Een lege, nieuwe database heeft geen inhoud om te beschermen.
+    fn backup_before_migration(conn: &Connection, path: &Path, version: i32) -> Result<()> {
+        let has_schema_objects: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('table', 'index', 'trigger', 'view'))",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_schema_objects {
+            return Ok(());
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("capture.db");
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let mut backup_path = path.with_file_name(format!(
+            "{file_name}.pre-migration-v{version}-{timestamp}.bak"
+        ));
+        let mut suffix = 1;
+        while backup_path.exists() {
+            backup_path = path.with_file_name(format!(
+                "{file_name}.pre-migration-v{version}-{timestamp}-{suffix}.bak"
+            ));
+            suffix += 1;
+        }
+
+        let backup_name = backup_path.to_string_lossy().into_owned();
+        conn.execute("VACUUM INTO ?1", [&backup_name])
+            .with_context(|| {
+                format!(
+                    "database-back-up maken vóór migratie mislukt: {}",
+                    backup_path.display()
+                )
+            })?;
+        tracing::info!(backup = %backup_path.display(), schema_version = version, "database-back-up gemaakt vóór schema-migratie");
+        Ok(())
+    }
+
+    /// Controleert alle databasepagina's; SQLite geeft `ok` terug als alles klopt.
+    pub fn integrity_check(&self) -> Result<()> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+        let results = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if results.len() == 1 && results[0] == "ok" {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "SQLite-integriteitscontrole mislukt: {}",
+                results.join("; ")
+            )
+        }
     }
 
     fn migrate_v1(conn: &Connection) -> Result<()> {
@@ -422,7 +485,11 @@ impl Db {
                  FROM apps a LEFT JOIN app_stats s ON s.app_id = a.id",
             )?;
             let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, u32>(2)?,
+                ))
             })?;
             for row in rows {
                 apps.push(row?);
@@ -477,19 +544,22 @@ impl Db {
         args.push(Box::new(q.offset.max(0)));
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), |r| {
-            Ok(SearchHit {
-                id: r.get(0)?,
-                ts: r.get(1)?,
-                app: r.get(2)?,
-                title: r.get(3)?,
-                kind: r.get(4)?,
-                source: r.get(5)?,
-                snippet: r.get(6)?,
-                quality: r.get(7)?,
-                has_frame: r.get::<_, Option<String>>(8)?.is_some(),
-            })
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())),
+            |r| {
+                Ok(SearchHit {
+                    id: r.get(0)?,
+                    ts: r.get(1)?,
+                    app: r.get(2)?,
+                    title: r.get(3)?,
+                    kind: r.get(4)?,
+                    source: r.get(5)?,
+                    snippet: r.get(6)?,
+                    quality: r.get(7)?,
+                    has_frame: r.get::<_, Option<String>>(8)?.is_some(),
+                })
+            },
+        )?;
 
         let mut out = Vec::new();
         for row in rows {
@@ -517,19 +587,22 @@ impl Db {
         args.push(Box::new(q.offset.max(0)));
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())), |r| {
-            Ok(SearchHit {
-                id: r.get(0)?,
-                ts: r.get(1)?,
-                app: r.get(2)?,
-                title: r.get(3)?,
-                kind: r.get(4)?,
-                source: r.get(5)?,
-                snippet: r.get(6)?,
-                quality: r.get(7)?,
-                has_frame: r.get::<_, Option<String>>(8)?.is_some(),
-            })
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())),
+            |r| {
+                Ok(SearchHit {
+                    id: r.get(0)?,
+                    ts: r.get(1)?,
+                    app: r.get(2)?,
+                    title: r.get(3)?,
+                    kind: r.get(4)?,
+                    source: r.get(5)?,
+                    snippet: r.get(6)?,
+                    quality: r.get(7)?,
+                    has_frame: r.get::<_, Option<String>>(8)?.is_some(),
+                })
+            },
+        )?;
 
         let mut out = Vec::new();
         for row in rows {
@@ -658,9 +731,8 @@ impl Db {
         }
 
         {
-            let mut stmt = conn.prepare(
-                "SELECT reason, SUM(count) FROM skips GROUP BY reason ORDER BY 2 DESC",
-            )?;
+            let mut stmt = conn
+                .prepare("SELECT reason, SUM(count) FROM skips GROUP BY reason ORDER BY 2 DESC")?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             for row in rows {
                 stats.skipped.push(row?);
@@ -687,7 +759,11 @@ impl Db {
     ///
     /// `frames_before` verwijdert alléén de afbeelding en laat de tekst staan;
     /// `captures_before` verwijdert de hele waarneming.
-    pub fn purge(&self, captures_before: Option<i64>, frames_before: Option<i64>) -> Result<PurgeReport> {
+    pub fn purge(
+        &self,
+        captures_before: Option<i64>,
+        frames_before: Option<i64>,
+    ) -> Result<PurgeReport> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let mut report = PurgeReport::default();
@@ -710,7 +786,8 @@ impl Db {
                 "DELETE FROM captures_fts WHERE rowid IN (SELECT id FROM captures WHERE ts < ?1)",
                 [cutoff],
             )?;
-            report.captures_deleted = tx.execute("DELETE FROM captures WHERE ts < ?1", [cutoff])? as i64;
+            report.captures_deleted =
+                tx.execute("DELETE FROM captures WHERE ts < ?1", [cutoff])? as i64;
             tx.execute(
                 "DELETE FROM segments WHERE ended_at < ?1
                  AND id NOT IN (SELECT DISTINCT segment_id FROM captures)",
@@ -749,11 +826,11 @@ impl Db {
     ) -> Result<(i64, i64)> {
         let conn = self.lock();
         let captures = match captures_before {
-            Some(cutoff) => {
-                conn.query_row("SELECT COUNT(*) FROM captures WHERE ts < ?1", [cutoff], |r| {
-                    r.get(0)
-                })?
-            }
+            Some(cutoff) => conn.query_row(
+                "SELECT COUNT(*) FROM captures WHERE ts < ?1",
+                [cutoff],
+                |r| r.get(0),
+            )?,
             None => 0,
         };
         let frames = match frames_before {
@@ -781,7 +858,10 @@ impl Db {
     /// die ook echt doorzoekbaar is; alleen daar heeft een capture een rij als
     /// er na filtering iets overbleef, dus de join filtert lege captures er
     /// vanzelf uit.
-    pub fn fetch_captures_since(&self, since_id: i64) -> Result<Vec<crate::embeddings::CaptureRow>> {
+    pub fn fetch_captures_since(
+        &self,
+        since_id: i64,
+    ) -> Result<Vec<crate::embeddings::CaptureRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT c.id, c.ts, a.key, s.title, c.source, c.frame_path, f.text
@@ -886,7 +966,11 @@ impl Db {
     pub fn load_ship_cursor(&self) -> Result<Option<i64>> {
         Ok(self
             .lock()
-            .query_row("SELECT last_seen_id FROM ship_cursor WHERE id = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT last_seen_id FROM ship_cursor WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
             .optional()?)
     }
 
@@ -902,7 +986,9 @@ impl Db {
     pub fn max_capture_id(&self) -> Result<i64> {
         Ok(self
             .lock()
-            .query_row("SELECT COALESCE(MAX(id), 0) FROM captures", [], |r| r.get(0))?)
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM captures", [], |r| {
+                r.get(0)
+            })?)
     }
 
     /// Expose lock voor indexer (pub(crate) via wrapper).
@@ -989,7 +1075,11 @@ mod tests {
             quality: 0.8,
             text,
             index_text: text,
-            frame_path: if kind == "image" { Some("2026/01/01/1.jpg") } else { None },
+            frame_path: if kind == "image" {
+                Some("2026/01/01/1.jpg")
+            } else {
+                None
+            },
             width: 1920,
             height: 1080,
             fallback_reason: None,
@@ -998,10 +1088,75 @@ mod tests {
     }
 
     #[test]
+    fn migratie_bewaart_oude_database_vooraf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE bewaar_test (waarde TEXT NOT NULL);
+                 INSERT INTO bewaar_test VALUES ('voor migratie');
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        db.integrity_check().unwrap();
+        let version: i32 = db
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let backup_path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("pre-migration-v3")
+            })
+            .expect("migratie-back-up ontbreekt");
+        let backup = Connection::open(backup_path).unwrap();
+        let backup_version: i32 = backup
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let value: String = backup
+            .query_row("SELECT waarde FROM bewaar_test", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_version, 3);
+        assert_eq!(value, "voor migratie");
+    }
+
+    #[test]
+    fn integrity_check_slaagt_op_geldige_database() {
+        let db = Db::open_in_memory().unwrap();
+        db.integrity_check().unwrap();
+    }
+
+    #[test]
     fn fts5_is_beschikbaar_en_zoekt() {
         let db = Db::open_in_memory().unwrap();
-        seed(&db, 1000, "code", "main.rs", "de kwartaalrapportage staat klaar", "text");
-        seed(&db, 2000, "chrome", "nieuws", "het weer wordt morgen beter", "text");
+        seed(
+            &db,
+            1000,
+            "code",
+            "main.rs",
+            "de kwartaalrapportage staat klaar",
+            "text",
+        );
+        seed(
+            &db,
+            2000,
+            "chrome",
+            "nieuws",
+            "het weer wordt morgen beter",
+            "text",
+        );
 
         let hits = db
             .search(&SearchQuery {
@@ -1012,13 +1167,24 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].app, "code");
-        assert!(hits[0].snippet.contains("kwartaalrapportage"), "{:?}", hits[0]);
+        assert!(
+            hits[0].snippet.contains("kwartaalrapportage"),
+            "{:?}",
+            hits[0]
+        );
     }
 
     #[test]
     fn lastige_tekens_laten_de_query_niet_klappen() {
         let db = Db::open_in_memory().unwrap();
-        seed(&db, 1000, "code", "main.rs", "gebruik van c++ en foo-bar hier", "text");
+        seed(
+            &db,
+            1000,
+            "code",
+            "main.rs",
+            "gebruik van c++ en foo-bar hier",
+            "text",
+        );
 
         for term in ["c++", "foo-bar", "\"quoted", "AND", "*"] {
             let hits = db.search(&SearchQuery {
@@ -1033,7 +1199,14 @@ mod tests {
     #[test]
     fn prefix_zoeken_werkt() {
         let db = Db::open_in_memory().unwrap();
-        seed(&db, 1000, "code", "main.rs", "kwartaalrapportage over verkoop", "text");
+        seed(
+            &db,
+            1000,
+            "code",
+            "main.rs",
+            "kwartaalrapportage over verkoop",
+            "text",
+        );
         let hits = db
             .search(&SearchQuery {
                 text: "kwartaal*".into(),
@@ -1089,7 +1262,12 @@ mod tests {
         assert_eq!(report.captures_deleted, 1);
         assert_eq!(report.frame_paths, vec!["2026/01/01/1.jpg".to_string()]);
 
-        let hits = db.search(&SearchQuery { limit: 10, ..Default::default() }).unwrap();
+        let hits = db
+            .search(&SearchQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].app, "code");
     }
@@ -1112,8 +1290,14 @@ mod tests {
     fn uitsluiting_is_hoofdletterongevoelig_en_sticky() {
         let db = Db::open_in_memory().unwrap();
         assert!(!db.is_excluded("domain", "MijnBank.com").unwrap());
-        assert!(db.mark_excluded("domain", "MijnBank.com", "password_field", 1).unwrap());
-        assert!(!db.mark_excluded("domain", "mijnbank.com", "password_field", 2).unwrap());
+        assert!(
+            db.mark_excluded("domain", "MijnBank.com", "password_field", 1)
+                .unwrap()
+        );
+        assert!(
+            !db.mark_excluded("domain", "mijnbank.com", "password_field", 2)
+                .unwrap()
+        );
         assert!(db.is_excluded("domain", "mijnbank.COM").unwrap());
         // Zelfde sleutel als ander soort is een andere uitsluiting.
         assert!(!db.is_excluded("app", "mijnbank.com").unwrap());
@@ -1127,7 +1311,9 @@ mod tests {
     fn leeg_segment_verdwijnt_maar_een_gevuld_segment_blijft() {
         let db = Db::open_in_memory().unwrap();
         let app_id = db.app_id("bank", "bank.exe", "").unwrap();
-        let leeg = db.open_segment(app_id, "Inloggen bij de bank", 1000).unwrap();
+        let leeg = db
+            .open_segment(app_id, "Inloggen bij de bank", 1000)
+            .unwrap();
         db.discard_segment_if_empty(leeg).unwrap();
         assert!(db.timeline(0, 10_000).unwrap().is_empty());
 
@@ -1178,7 +1364,15 @@ mod tests {
     #[test]
     fn zoekresultaten_dragen_hun_bron_mee() {
         let db = Db::open_in_memory().unwrap();
-        seed_with_source(&db, 1000, "code", "main.rs", "declaratie indienen", "text", "uia");
+        seed_with_source(
+            &db,
+            1000,
+            "code",
+            "main.rs",
+            "declaratie indienen",
+            "text",
+            "uia",
+        );
 
         let hits = db
             .search(&SearchQuery {
