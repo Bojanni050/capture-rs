@@ -990,7 +990,6 @@ impl Db {
                 r.get(0)
             })?)
     }
-
 }
 
 /// Voegt de gedeelde WHERE-filters toe aan zowel zoeken als bladeren.
