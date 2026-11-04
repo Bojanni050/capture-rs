@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::embeddings::document::{CaptureRow, build_documents};
@@ -11,18 +10,12 @@ use crate::embeddings::provider::EmbeddingProvider;
 use crate::embeddings::store::VectorStore;
 use crate::store::Db;
 
-/// Events die de pipeline kan sturen; voor v1 gebruiken we poll, maar channel is al klaar.
-pub enum IndexCommand {
-    Capture(i64),
-}
-
 /// Indexer die periodiek SQLite polled en embeddings bijwerkt.
 pub struct Indexer {
     cfg: Config,
     db: Arc<Db>,
     store: Arc<dyn VectorStore>,
     provider: Arc<dyn EmbeddingProvider>,
-    rx: Option<mpsc::UnboundedReceiver<IndexCommand>>,
 }
 
 impl Indexer {
@@ -31,18 +24,16 @@ impl Indexer {
         db: Arc<Db>,
         store: Arc<dyn VectorStore>,
         provider: Arc<dyn EmbeddingProvider>,
-        rx: Option<mpsc::UnboundedReceiver<IndexCommand>>,
     ) -> Self {
         Self {
             cfg,
             db,
             store,
             provider,
-            rx,
         }
     }
 
-    pub async fn run(mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
         if !self.cfg.embeddings.enabled {
             tracing::info!("embeddings uitgeschakeld — indexer slaapt");
             // Wacht tot shutdown, doe niets.
@@ -72,13 +63,6 @@ impl Indexer {
                         Ok(n) if n > 0 => tracing::info!(ingedeeld = n, "semantic documents geïndexeerd"),
                         Ok(_) => {},
                         Err(e) => tracing::warn!(error = %e, "indexer tick faalde — retry later"),
-                    }
-                }
-                cmd = async { match &mut self.rx { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {
-                    if let Some(IndexCommand::Capture(id)) = cmd {
-                        if id > last_seen_id { last_seen_id = id - 1; }
-                    } else {
-                        // Channel gesloten → alleen poll
                     }
                 }
                 _ = shutdown.changed() => {
@@ -210,7 +194,6 @@ mod tests {
             Arc::clone(&db),
             store.clone(),
             Arc::new(MockProvider::default()),
-            None,
         );
 
         let mut cursor = indexer.initial_cursor().await.unwrap();
@@ -227,7 +210,6 @@ mod tests {
             db,
             Arc::new(InMemoryStore::new()),
             Arc::new(MockProvider::default()),
-            None,
         );
         assert_eq!(restarted.initial_cursor().await.unwrap(), 0);
     }

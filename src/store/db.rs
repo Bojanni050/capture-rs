@@ -990,11 +990,6 @@ impl Db {
                 r.get(0)
             })?)
     }
-
-    /// Expose lock voor indexer (pub(crate) via wrapper).
-    pub(crate) fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.lock()
-    }
 }
 
 /// Voegt de gedeelde WHERE-filters toe aan zowel zoeken als bladeren.
