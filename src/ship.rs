@@ -25,7 +25,7 @@ use crate::config::ShipConfig;
 use crate::embeddings::CaptureRow;
 use crate::store::Db;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -162,6 +162,7 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    use chrono::{DateTime, Utc};
     use super::*;
     use crate::store::NewCapture;
     use axum::extract::State;

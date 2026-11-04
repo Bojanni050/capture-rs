@@ -126,15 +126,13 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 pub struct PgVectorStore {
     url: String,
     dimensions: usize,
-    model: String,
 }
 
 impl PgVectorStore {
-    pub fn new(url: impl Into<String>, dimensions: usize, model: impl Into<String>) -> Self {
+    pub fn new(url: impl Into<String>, dimensions: usize) -> Self {
         Self {
             url: url.into(),
             dimensions,
-            model: model.into(),
         }
     }
 
@@ -413,6 +411,6 @@ mod tests {
     #[test]
     fn alleen_persistent_store_is_duurzaam() {
         assert!(!InMemoryStore::new().is_durable());
-        assert!(PgVectorStore::new("postgres://localhost/capture", 384, "mock").is_durable());
+        assert!(PgVectorStore::new("postgres://localhost/capture", 384).is_durable());
     }
 }

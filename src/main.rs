@@ -416,7 +416,7 @@ async fn cmd_start(
     let indexer_handle = if cfg.embeddings.enabled {
         let store = embeddings_store.clone().expect("enabled");
         let provider = embeddings_provider.clone().expect("enabled");
-        let indexer = embeddings::Indexer::new(cfg.clone(), Arc::clone(&db), store, provider, None);
+        let indexer = embeddings::Indexer::new(cfg.clone(), Arc::clone(&db), store, provider);
         let (idx_tx, idx_rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(async move {
             if let Err(e) = indexer.run(idx_rx).await {

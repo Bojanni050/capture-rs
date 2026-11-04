@@ -3,20 +3,19 @@ pub mod provider;
 pub mod store;
 pub mod indexer;
 
-pub use document::{SemanticDocument, CaptureRow, build_documents, content_hash};
+pub use document::{CaptureRow, build_documents};
 pub use provider::{EmbeddingProvider, FastEmbedProvider, MockProvider};
-pub use store::{VectorStore, InMemoryStore, PgVectorStore, SemanticHit};
-pub use indexer::{Indexer, IndexCommand};
+pub use store::{VectorStore, InMemoryStore, PgVectorStore};
+pub use indexer::Indexer;
 
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::store::Db;
 
 /// Helper om de juiste store te maken op basis van config.
 pub fn make_store(cfg: &Config) -> Arc<dyn VectorStore> {
     if let Some(url) = cfg.embeddings_postgres_url() {
-        let store = PgVectorStore::new(url, cfg.embeddings.dimensions, cfg.embeddings.model.clone());
+        let store = PgVectorStore::new(url, cfg.embeddings.dimensions);
         Arc::new(store) as Arc<dyn VectorStore>
     } else {
         Arc::new(InMemoryStore::new()) as Arc<dyn VectorStore>
@@ -60,17 +59,4 @@ fn fallback_mock(cfg: &Config, reason: &str) -> Arc<dyn EmbeddingProvider> {
         cfg.embeddings.dimensions,
         cfg.embeddings.model.clone(),
     )) as Arc<dyn EmbeddingProvider>
-}
-
-/// Factory voor indexer — gebruikt in pipeline en serve.
-pub async fn make_indexer(
-    cfg: Config,
-    db: Arc<Db>,
-) -> (Indexer, Option<tokio::sync::mpsc::UnboundedSender<IndexCommand>>) {
-    let store = make_store(&cfg);
-    let provider = make_provider(&cfg).await;
-    // Channel voor directe capture notificaties (optioneel, poll blijft werken).
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let indexer = Indexer::new(cfg, db, store, provider, Some(rx));
-    (indexer, Some(tx))
 }
