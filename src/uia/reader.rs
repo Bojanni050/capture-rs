@@ -22,7 +22,7 @@ use windows::Win32::UI::Accessibility::{
     IUIAutomationCondition,
     AutomationElementMode_None, CUIAutomation, IUIAutomation, IUIAutomationCacheRequest,
     IUIAutomationElement, IUIAutomationTextPattern, IUIAutomationValuePattern,
-    TreeScope_Subtree, UIA_ControlTypePropertyId, UIA_CONTROLTYPE_ID,
+    TreeScope_Subtree, UIA_ClassNamePropertyId, UIA_ControlTypePropertyId, UIA_CONTROLTYPE_ID,
     UIA_DataItemControlTypeId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
     UIA_HyperlinkControlTypeId, UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
     UIA_ListItemControlTypeId,
@@ -89,6 +89,7 @@ impl UiaReader {
             // Precies de properties die we straks lezen, en niets meer.
             cache.AddProperty(UIA_NamePropertyId)?;
             cache.AddProperty(UIA_ControlTypePropertyId)?;
+            cache.AddProperty(UIA_ClassNamePropertyId)?;
             cache.AddProperty(UIA_IsOffscreenPropertyId)?;
             cache.AddProperty(UIA_IsPasswordPropertyId)?;
             cache.AddPattern(UIA_ValuePatternId)?;
@@ -192,6 +193,18 @@ impl UiaReader {
 
         let control_type = unsafe { element.CachedControlType() }.unwrap_or(UIA_CONTROLTYPE_ID(0));
 
+        // De favorietenbalk van Chromium is een rij ListItems met de interne
+        // klassenaam `BookmarkButton`. Zonder deze controle belanden die
+        // bladwijzernamen als gewone regels in de capture, waar ze niet te
+        // onderscheiden zijn van de titels van open tabbladen. Het zijn echter
+        // browser-chrome, geen pagina-inhoud.
+        let class_name = unsafe { element.CachedClassName() }
+            .map(|name| name.to_string())
+            .unwrap_or_default();
+        if is_bookmark_bar_item(&class_name) {
+            return;
+        }
+
         if let Ok(name) = unsafe { element.CachedName() } {
             let name = name.to_string();
             if carries_text(control_type, &name) {
@@ -210,6 +223,14 @@ impl UiaReader {
             push_text(out, &value.to_string());
         }
     }
+}
+
+/// Herkent de items op de favorietenbalk van Chromium-browsers (Chrome, Edge,
+/// Brave, Vivaldi, Opera). Die worden door de accessibility-laag als ListItem
+/// met klassenaam `BookmarkButton` aangeboden — dezelfde control type als echte
+/// lijstitems in pagina's, dus de klassenaam is het enige betrouwbare verschil.
+pub(crate) fn is_bookmark_bar_item(class_name: &str) -> bool {
+    class_name.eq_ignore_ascii_case("BookmarkButton")
 }
 
 /// Draagt dit element betekenisvolle tekst, of is het chrome?
@@ -288,6 +309,16 @@ mod tests {
         // 50033 is UIA_PaneControlTypeId: een container, geen inhoud.
         assert!(!carries_text(UIA_CONTROLTYPE_ID(50033), "Hoofdvenster"));
         assert!(carries_text(UIA_HyperlinkControlTypeId, "Lees verder"));
+    }
+
+    #[test]
+    fn favorietenbalk_items_zijn_geen_inhoud() {
+        // Chromium levert favorieten als ListItem met deze klassenaam; ze
+        // mogen niet als (schijnbare) tabblad titels in de capture belanden.
+        assert!(is_bookmark_bar_item("BookmarkButton"));
+        assert!(is_bookmark_bar_item("bookmarkbutton"));
+        assert!(!is_bookmark_bar_item(""));
+        assert!(!is_bookmark_bar_item("EdgeTab"));
     }
 
     #[test]
