@@ -14,20 +14,24 @@
 // Microsoft-documentatie.
 #![allow(non_upper_case_globals)]
 
+use crate::capture::Rect;
 use crate::com::ensure_mta;
 use anyhow::{anyhow, Context, Result};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
     IUIAutomationCondition,
     AutomationElementMode_None, CUIAutomation, IUIAutomation, IUIAutomationCacheRequest,
     IUIAutomationElement, IUIAutomationTextPattern, IUIAutomationValuePattern,
-    TreeScope_Subtree, UIA_ClassNamePropertyId, UIA_ControlTypePropertyId, UIA_CONTROLTYPE_ID,
+    TreeScope_Subtree, UIA_BoundingRectanglePropertyId, UIA_ClassNamePropertyId,
+    UIA_ControlTypePropertyId, UIA_CONTROLTYPE_ID,
     UIA_DataItemControlTypeId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
     UIA_HyperlinkControlTypeId, UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
     UIA_ListItemControlTypeId,
     UIA_MenuItemControlTypeId, UIA_NamePropertyId, UIA_TabItemControlTypeId,
-    UIA_TextControlTypeId, UIA_TextPatternId, UIA_TreeItemControlTypeId, UIA_ValuePatternId,
+    UIA_TextControlTypeId, UIA_TextPatternId, UIA_ToolBarControlTypeId, UIA_TreeItemControlTypeId,
+    UIA_ValuePatternId,
 };
 
 /// Boven deze lengte is een losse Name geen label meer maar een heel document;
@@ -43,6 +47,11 @@ pub struct UiaReader {
     /// daarnaast elk decoratief paneel en elke scrollbar, en op een
     /// Electron-venster scheelt dat een orde van grootte in tijd.
     content_view: IUIAutomationCondition,
+    /// Gerichte query voor de favorietenbalk van Chromium-browsers. Bewust
+    /// geen onderdeel van de brede sweep: die leest de content view, en de
+    /// balk hoort bij het browser-chrome.
+    bar_condition: IUIAutomationCondition,
+    bar_cache: IUIAutomationCacheRequest,
     max_elements: i32,
 }
 
@@ -85,6 +94,26 @@ impl UiaReader {
         let content_view = unsafe { automation.ContentViewCondition() }
             .context("content view opvragen mislukt")?;
 
+        let bar_cache = unsafe { automation.CreateCacheRequest() }
+            .context("UIA-cacheverzoek voor favorietenbalk aanmaken mislukt")?;
+
+        let bar_condition = unsafe {
+            let type_condition = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_ToolBarControlTypeId.0),
+            )?;
+            let class_condition = automation.CreatePropertyCondition(
+                UIA_ClassNamePropertyId,
+                &VARIANT::from("BookmarkBarView"),
+            )?;
+            let condition = automation.CreateAndCondition(&type_condition, &class_condition)?;
+
+            bar_cache.AddProperty(UIA_BoundingRectanglePropertyId)?;
+            bar_cache.SetTreeScope(TreeScope_Subtree)?;
+            bar_cache.SetAutomationElementMode(AutomationElementMode_None)?;
+            condition
+        };
+
         unsafe {
             // Precies de properties die we straks lezen, en niets meer.
             cache.AddProperty(UIA_NamePropertyId)?;
@@ -105,8 +134,27 @@ impl UiaReader {
             automation,
             cache,
             content_view,
+            bar_condition,
+            bar_cache,
             max_elements: max_elements.clamp(50, 20_000) as i32,
         })
+    }
+
+    /// Rechthoek van de favorietenbalk van een Chromium-browser, in fysieke
+    /// schermpixels. `None` als de balk niet zichtbaar is of de query mislukt:
+    /// dan valt er niets te maskeren en blijft OCR zoals het was.
+    pub fn bookmark_bar(&self, hwnd: HWND) -> Option<Rect> {
+        if hwnd.is_invalid() {
+            return None;
+        }
+
+        let root = unsafe { self.automation.ElementFromHandle(hwnd) }.ok()?;
+        let bar = unsafe {
+            root.FindFirstBuildCache(TreeScope_Subtree, &self.bar_condition, &self.bar_cache)
+        }
+        .ok()?;
+        let rect = unsafe { bar.CachedBoundingRectangle() }.ok()?;
+        Some(rect.into())
     }
 
     /// Leest alle zichtbare tekst uit één venster, in boomvolgorde.

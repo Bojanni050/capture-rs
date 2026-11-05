@@ -47,7 +47,7 @@ impl WindowInfo {
 /// Vereist dat het proces per-monitor DPI-bewust is (zie `main.rs`); zonder
 /// dat geeft Windows gevirtualiseerde coördinaten terug die niet meer
 /// overeenkomen met de fysieke pixels van een screenshot.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub left: i32,
     pub top: i32,
