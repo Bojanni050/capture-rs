@@ -25,3 +25,25 @@ jobs:
         run: cargo clippy --all-targets
       - name: Run tests
         run: cargo test --release
+      - name: Build release binary
+        run: cargo build --release
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        # setup.exe moet dezelfde versie melden als `capture --version`; de
+        # versie staat in Cargo.toml en in installer\capture.iss.
+        run: |
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          $iss = (Select-String -Path installer\capture.iss -Pattern '^#define AppVersion "(.+)"').Matches[0].Groups[1].Value
+          if ($cargo -ne $iss) { throw "installer\capture.iss noemt versie $iss, Cargo.toml $cargo" }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\capture.iss
+      - name: Upload installer
+        # Alleen op een push: een pull request hoeft de installer wél te bouwen
+        # (dat controleert het .iss), maar hoeft geen 36 MB artifact te bewaren.
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: capture-setup
+          path: dist/*.exe
+          if-no-files-found: error
+          retention-days: 30

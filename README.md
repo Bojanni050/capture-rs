@@ -198,6 +198,18 @@ cargo build --release
 
 De binary staat in `target/release/capture.exe`.
 
+Wil je er een installeerbare versie van maken (per gebruiker, geen admin, met
+startmenu-snelkoppelingen en een autostart-vinkje):
+
+```powershell
+choco install innosetup -y     # eenmalig
+.\installer\build.ps1
+```
+
+Dat levert `dist\Capture-<versie>-setup.exe` op; zie
+[`installer/README.md`](installer/README.md) voor wat de installer wel en niet
+doet.
+
 ## Gebruik
 
 ```bash
