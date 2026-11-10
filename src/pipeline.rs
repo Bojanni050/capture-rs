@@ -38,7 +38,7 @@ use crate::tray::{Status as TrayState, TrayStatus};
 use crate::uia::{self, UiaService};
 use anyhow::{Context, Result};
 use chrono::Local;
-use image::RgbaImage;
+use image::{Rgba, RgbaImage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -451,6 +451,15 @@ impl Pipeline {
                 None => shot.image,
             };
 
+            // Oorsprong van het bijgesneden beeld in virtuele-schermpixels.
+            // UIA geeft rechthoeken in diezelfde ruimte; zonder deze
+            // vertaling zou een masker op een tweede monitor of bij een
+            // deels buiten beeld staand venster op de verkeerde plek vallen.
+            let origin = match win_rect {
+                Some(rect) => (rect.left.max(shot.x), rect.top.max(shot.y)),
+                None => (shot.x, shot.y),
+            };
+
             let password_found = self
                 .process_frame(
                     FrameContext {
@@ -463,6 +472,7 @@ impl Pipeline {
                         now: &now,
                     },
                     image,
+                    origin,
                 )
                 .await?;
             if password_found {
@@ -477,7 +487,12 @@ impl Pipeline {
         Ok(())
     }
 
-    async fn process_frame(&mut self, ctx: FrameContext<'_>, image: RgbaImage) -> Result<bool> {
+    async fn process_frame(
+        &mut self,
+        ctx: FrameContext<'_>,
+        image: RgbaImage,
+        origin: (i32, i32),
+    ) -> Result<bool> {
         let Some(hash) = self.check_frame_duplicate(&ctx, &image)? else {
             return Ok(false);
         };
@@ -487,9 +502,9 @@ impl Pipeline {
         // scherm toegepast: het beschrijft alleen het voorgrondvenster.
         let single_monitor = self.capturer.is_single_monitor();
         let read = if single_monitor {
-            self.read_text(ctx.app_key, ctx.hwnd, &image).await
+            self.read_text(ctx.app_key, ctx.hwnd, &image, origin).await
         } else {
-            self.read_ocr(&image, None).await
+            self.read_ocr(&image, None, None, origin).await
         };
         self.process_frame_content(ctx, image, hash, read, single_monitor)
     }
@@ -658,11 +673,21 @@ impl Pipeline {
     }
 
     /// Haalt tekst op via UIA en valt bij een onbruikbare boom terug op OCR.
-    async fn read_text(&mut self, app_key: &str, hwnd: isize, image: &RgbaImage) -> TextRead {
+    async fn read_text(
+        &mut self,
+        app_key: &str,
+        hwnd: isize,
+        image: &RgbaImage,
+        origin: (i32, i32),
+    ) -> TextRead {
         let mut note = None;
+        let mut bookmark_bar = None;
+        // Alleen browsers hebben een favorietenbalk; voor andere apps zou de
+        // gerichte UIA-query alleen tijd kosten.
+        let want_bookmark_bar = self.is_browser(app_key);
 
         if let Some(service) = &mut self.uia {
-            match service.read(app_key, hwnd).await {
+            match service.read(app_key, hwnd, want_bookmark_bar).await {
                 uia::Outcome::Text(lines) => {
                     return TextRead {
                         lines,
@@ -679,20 +704,35 @@ impl Pipeline {
                         password: true,
                     };
                 }
-                uia::Outcome::Unavailable(reason) => {
+                uia::Outcome::Unavailable {
+                    reason,
+                    bookmark_bar: bar,
+                } => {
                     tracing::trace!(app = app_key, reden = reason, "uia overgeslagen");
                     note = Some(reason.to_string());
+                    bookmark_bar = bar;
                 }
             }
         }
 
-        self.read_ocr(image, note).await
+        self.read_ocr(image, note, bookmark_bar, origin).await
     }
 
-    /// Leest één screenshot via OCR, met optioneel de reden waarom UIA afviel.
-    async fn read_ocr(&self, image: &RgbaImage, note: Option<String>) -> TextRead {
+    /// Leest één screenshot via OCR, met optioneel de reden waarom UIA afviel
+    /// en de favorietenbalk die vóór het maskeren verborgen moet worden.
+    async fn read_ocr(
+        &self,
+        image: &RgbaImage,
+        note: Option<String>,
+        bookmark_bar: Option<Rect>,
+        origin: (i32, i32),
+    ) -> TextRead {
         if let Some(service) = &self.ocr {
-            match service.recognize(image.clone()).await {
+            let mut image = image.clone();
+            if let Some(bar) = bookmark_bar {
+                mask_bookmark_bar(&mut image, bar, origin);
+            }
+            match service.recognize(image).await {
                 Ok(raw) => {
                     return TextRead {
                         lines: raw.lines,
@@ -874,6 +914,47 @@ impl Pipeline {
 
 fn window_key(app_key: &str, title: &str) -> String {
     format!("{app_key}::{title}")
+}
+
+/// Verbergt de favorietenbalk van een Chromium-browser in het OCR-beeld.
+///
+/// UIA geeft de balk in fysieke schermpixels; het beeld is bijgesneden tot het
+/// venster (en dus tot deze monitor). `origin` is de oorsprong van dat beeld
+/// in dezelfde ruimte. Alleen een plausibele strook wordt gemaskeerd: een
+/// verkeerde of verplaatste rechthoek mag nooit pagina-inhoud wissen.
+fn mask_bookmark_bar(image: &mut RgbaImage, bar: Rect, origin: (i32, i32)) -> bool {
+    let (w, h) = (image.width() as i32, image.height() as i32);
+    let left = (bar.left - origin.0).max(0);
+    let top = (bar.top - origin.1).max(0);
+    let right = (bar.right - origin.0).min(w);
+    let bottom = (bar.bottom - origin.1).min(h);
+    if right <= left || bottom <= top {
+        return false;
+    }
+
+    let width = right - left;
+    let height = bottom - top;
+    if !(8..=160).contains(&height) {
+        return false;
+    }
+    // De balk loopt over (vrijwel) de volle breedte van het venster. Een
+    // smalle strook is iets anders — bijvoorbeeld de tabgroepenbalk — en
+    // maskeren daarvan kan echte inhoud raken.
+    if width * 2 < w {
+        return false;
+    }
+    // De favorietenbalk hoort bovenin. Een rect diep in het venster is geen
+    // browser-chrome maar waarschijnlijk een verkeerd gemapte coördinaat.
+    if top > h / 3 {
+        return false;
+    }
+
+    for y in top..bottom {
+        for x in left..right {
+            image.put_pixel(x as u32, y as u32, Rgba([255, 255, 255, 255]));
+        }
+    }
+    true
 }
 
 /// Snijdt een shot bij tot het snijvlak met `rect`, een vensterrechthoek in
@@ -1183,5 +1264,47 @@ mod tests {
         // scherm: nul breedte, geen overlap om iets uit te lezen.
         let result = crop_to_window(&img, 0, 0, rect(-100, 0, 0, 400));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn favorietenbalk_wordt_gemaskt_en_pagina_blijft_heel() {
+        let mut img = RgbaImage::from_pixel(200, 200, Rgba([10, 20, 30, 255]));
+        let bar = rect(0, 20, 200, 54);
+        assert!(mask_bookmark_bar(&mut img, bar, (0, 0)));
+
+        assert_eq!(img.get_pixel(100, 20), &Rgba([255, 255, 255, 255]));
+        assert_eq!(img.get_pixel(100, 53), &Rgba([255, 255, 255, 255]));
+        assert_eq!(img.get_pixel(100, 19), &Rgba([10, 20, 30, 255]));
+        assert_eq!(img.get_pixel(100, 54), &Rgba([10, 20, 30, 255]));
+    }
+
+    #[test]
+    fn masker_volgt_de_oorsprong_van_het_bijgesneden_beeld() {
+        let mut img = RgbaImage::from_pixel(200, 200, Rgba([10, 20, 30, 255]));
+        // Het venster begint op scherm-x 1000; de balk dus ook. Het beeld
+        // begint bij die oorsprong, dus in beeld is de balk gewoon x=0..200.
+        let bar = rect(1000, 20, 1200, 54);
+        assert!(mask_bookmark_bar(&mut img, bar, (1000, 0)));
+        assert_eq!(img.get_pixel(0, 20), &Rgba([255, 255, 255, 255]));
+        assert_eq!(img.get_pixel(199, 53), &Rgba([255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn onwaarschijnlijke_favorietenbalk_wordt_niet_gemaskt() {
+        // Te smal: dit is eerder de tabgroepenbalk dan de volle favorietenbalk.
+        let mut img = RgbaImage::from_pixel(200, 200, Rgba([10, 20, 30, 255]));
+        assert!(!mask_bookmark_bar(&mut img, rect(0, 20, 80, 54), (0, 0)));
+
+        // Te diep in het venster: geen browser-chrome meer.
+        let mut img = RgbaImage::from_pixel(200, 200, Rgba([10, 20, 30, 255]));
+        assert!(!mask_bookmark_bar(&mut img, rect(0, 150, 200, 184), (0, 0)));
+
+        // Te hoog: dit is niet één balk maar een groot deel van het beeld.
+        let mut img = RgbaImage::from_pixel(200, 400, Rgba([10, 20, 30, 255]));
+        assert!(!mask_bookmark_bar(&mut img, rect(0, 0, 200, 300), (0, 0)));
+
+        // Volledig buiten het beeld.
+        let mut img = RgbaImage::from_pixel(200, 200, Rgba([10, 20, 30, 255]));
+        assert!(!mask_bookmark_bar(&mut img, rect(0, 300, 200, 334), (0, 0)));
     }
 }

@@ -14,20 +14,24 @@
 // Microsoft-documentatie.
 #![allow(non_upper_case_globals)]
 
+use crate::capture::Rect;
 use crate::com::ensure_mta;
 use anyhow::{anyhow, Context, Result};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
     IUIAutomationCondition,
     AutomationElementMode_None, CUIAutomation, IUIAutomation, IUIAutomationCacheRequest,
     IUIAutomationElement, IUIAutomationTextPattern, IUIAutomationValuePattern,
-    TreeScope_Subtree, UIA_ControlTypePropertyId, UIA_CONTROLTYPE_ID,
+    TreeScope_Subtree, UIA_BoundingRectanglePropertyId, UIA_ClassNamePropertyId,
+    UIA_ControlTypePropertyId, UIA_CONTROLTYPE_ID,
     UIA_DataItemControlTypeId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
     UIA_HyperlinkControlTypeId, UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
     UIA_ListItemControlTypeId,
     UIA_MenuItemControlTypeId, UIA_NamePropertyId, UIA_TabItemControlTypeId,
-    UIA_TextControlTypeId, UIA_TextPatternId, UIA_TreeItemControlTypeId, UIA_ValuePatternId,
+    UIA_TextControlTypeId, UIA_TextPatternId, UIA_ToolBarControlTypeId, UIA_TreeItemControlTypeId,
+    UIA_ValuePatternId,
 };
 
 /// Boven deze lengte is een losse Name geen label meer maar een heel document;
@@ -43,6 +47,11 @@ pub struct UiaReader {
     /// daarnaast elk decoratief paneel en elke scrollbar, en op een
     /// Electron-venster scheelt dat een orde van grootte in tijd.
     content_view: IUIAutomationCondition,
+    /// Gerichte query voor de favorietenbalk van Chromium-browsers. Bewust
+    /// geen onderdeel van de brede sweep: die leest de content view, en de
+    /// balk hoort bij het browser-chrome.
+    bar_condition: IUIAutomationCondition,
+    bar_cache: IUIAutomationCacheRequest,
     max_elements: i32,
 }
 
@@ -85,10 +94,31 @@ impl UiaReader {
         let content_view = unsafe { automation.ContentViewCondition() }
             .context("content view opvragen mislukt")?;
 
+        let bar_cache = unsafe { automation.CreateCacheRequest() }
+            .context("UIA-cacheverzoek voor favorietenbalk aanmaken mislukt")?;
+
+        let bar_condition = unsafe {
+            let type_condition = automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &VARIANT::from(UIA_ToolBarControlTypeId.0),
+            )?;
+            let class_condition = automation.CreatePropertyCondition(
+                UIA_ClassNamePropertyId,
+                &VARIANT::from("BookmarkBarView"),
+            )?;
+            let condition = automation.CreateAndCondition(&type_condition, &class_condition)?;
+
+            bar_cache.AddProperty(UIA_BoundingRectanglePropertyId)?;
+            bar_cache.SetTreeScope(TreeScope_Subtree)?;
+            bar_cache.SetAutomationElementMode(AutomationElementMode_None)?;
+            condition
+        };
+
         unsafe {
             // Precies de properties die we straks lezen, en niets meer.
             cache.AddProperty(UIA_NamePropertyId)?;
             cache.AddProperty(UIA_ControlTypePropertyId)?;
+            cache.AddProperty(UIA_ClassNamePropertyId)?;
             cache.AddProperty(UIA_IsOffscreenPropertyId)?;
             cache.AddProperty(UIA_IsPasswordPropertyId)?;
             cache.AddPattern(UIA_ValuePatternId)?;
@@ -104,8 +134,27 @@ impl UiaReader {
             automation,
             cache,
             content_view,
+            bar_condition,
+            bar_cache,
             max_elements: max_elements.clamp(50, 20_000) as i32,
         })
+    }
+
+    /// Rechthoek van de favorietenbalk van een Chromium-browser, in fysieke
+    /// schermpixels. `None` als de balk niet zichtbaar is of de query mislukt:
+    /// dan valt er niets te maskeren en blijft OCR zoals het was.
+    pub fn bookmark_bar(&self, hwnd: HWND) -> Option<Rect> {
+        if hwnd.is_invalid() {
+            return None;
+        }
+
+        let root = unsafe { self.automation.ElementFromHandle(hwnd) }.ok()?;
+        let bar = unsafe {
+            root.FindFirstBuildCache(TreeScope_Subtree, &self.bar_condition, &self.bar_cache)
+        }
+        .ok()?;
+        let rect = unsafe { bar.CachedBoundingRectangle() }.ok()?;
+        Some(rect.into())
     }
 
     /// Leest alle zichtbare tekst uit één venster, in boomvolgorde.
@@ -192,6 +241,18 @@ impl UiaReader {
 
         let control_type = unsafe { element.CachedControlType() }.unwrap_or(UIA_CONTROLTYPE_ID(0));
 
+        // De favorietenbalk van Chromium is een rij ListItems met de interne
+        // klassenaam `BookmarkButton`. Zonder deze controle belanden die
+        // bladwijzernamen als gewone regels in de capture, waar ze niet te
+        // onderscheiden zijn van de titels van open tabbladen. Het zijn echter
+        // browser-chrome, geen pagina-inhoud.
+        let class_name = unsafe { element.CachedClassName() }
+            .map(|name| name.to_string())
+            .unwrap_or_default();
+        if is_bookmark_bar_item(&class_name) {
+            return;
+        }
+
         if let Ok(name) = unsafe { element.CachedName() } {
             let name = name.to_string();
             if carries_text(control_type, &name) {
@@ -210,6 +271,14 @@ impl UiaReader {
             push_text(out, &value.to_string());
         }
     }
+}
+
+/// Herkent de items op de favorietenbalk van Chromium-browsers (Chrome, Edge,
+/// Brave, Vivaldi, Opera). Die worden door de accessibility-laag als ListItem
+/// met klassenaam `BookmarkButton` aangeboden — dezelfde control type als echte
+/// lijstitems in pagina's, dus de klassenaam is het enige betrouwbare verschil.
+pub(crate) fn is_bookmark_bar_item(class_name: &str) -> bool {
+    class_name.eq_ignore_ascii_case("BookmarkButton")
 }
 
 /// Draagt dit element betekenisvolle tekst, of is het chrome?
@@ -288,6 +357,16 @@ mod tests {
         // 50033 is UIA_PaneControlTypeId: een container, geen inhoud.
         assert!(!carries_text(UIA_CONTROLTYPE_ID(50033), "Hoofdvenster"));
         assert!(carries_text(UIA_HyperlinkControlTypeId, "Lees verder"));
+    }
+
+    #[test]
+    fn favorietenbalk_items_zijn_geen_inhoud() {
+        // Chromium levert favorieten als ListItem met deze klassenaam; ze
+        // mogen niet als (schijnbare) tabblad titels in de capture belanden.
+        assert!(is_bookmark_bar_item("BookmarkButton"));
+        assert!(is_bookmark_bar_item("bookmarkbutton"));
+        assert!(!is_bookmark_bar_item(""));
+        assert!(!is_bookmark_bar_item("EdgeTab"));
     }
 
     #[test]
