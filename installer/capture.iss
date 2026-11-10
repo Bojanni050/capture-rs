@@ -39,6 +39,9 @@ CloseApplications=yes
 RestartApplications=no
 UninstallDisplayIcon={app}\capture.exe
 UninstallDisplayName={#AppName}
+; Inno vult FileVersion alleen bij een vierdelig versienummer; zonder deze
+; regel blijft dat veld leeg in het Eigenschappen-venster van setup.exe.
+VersionInfoVersion={#AppVersion}.0
 
 [Files]
 ; Eén binary, niets ernaast: ONNX Runtime zit er statisch in, de tray-icoon
