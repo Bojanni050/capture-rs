@@ -1,17 +1,36 @@
-//! Recente logregels in het geheugen, voor de webinterface.
+//! Recente logregels in het geheugen, voor de webinterface, plus een vast
+//! logbestand dat een crash overleeft.
 //!
 //! Zodra je met `--hide-console` draait is de terminal weg; dit houdt de
 //! laatste regels vast zodat `/api/logs` ze alsnog kan tonen. Werkt via een
 //! `MakeWriter` die elke regel naar stderr én naar deze buffer schrijft —
 //! stderr blijft dus gewoon werken voor wie de terminal wél open heeft.
+//!
+//! Bij automatisch opstarten is er nooit een terminal. Daarom gaat elke regel
+//! óók direct (ongebufferd) naar `%LOCALAPPDATA%\Capture\logs\capture.log`,
+//! samen met expliciete opstartfasen. Een harde crash — heap-corruptie geeft
+//! geen panic en geen unwinding — laat zo toch zijn laatste regel achter.
 
 use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 /// Hoeveel regels we bewaren: genoeg voor het opstarten plus de laatste
 /// gebeurtenissen, klein genoeg om nooit serieus geheugen te kosten.
 const CAPACITY: usize = 300;
+
+const LOGBESTAND: &str = "capture.log";
+const OUDE_LOGBESTAND: &str = "capture.1.log";
+/// Boven deze grootte schuift het bestand bij de volgende start op naar
+/// `capture.1.log`. Eén oude run bewaren is genoeg om een crash te vergelijken.
+const MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+static BESTAND: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+static LOGPAD: OnceLock<Option<PathBuf>> = OnceLock::new();
+static START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LogEntry {
@@ -53,6 +72,107 @@ impl LogBuffer {
     }
 }
 
+// --- bestandslog ----------------------------------------------------------
+
+/// Waar het logbestand hoort, ook bruikbaar vóór [`init_file_log`] (doctor).
+pub fn log_path() -> Option<PathBuf> {
+    if let Some(pad) = LOGPAD.get() {
+        return pad.clone();
+    }
+    crate::config::app_root()
+        .ok()
+        .map(|root| root.join("logs").join(LOGBESTAND))
+}
+
+/// Opent het logbestand en schrijft de sessiekop. Faalt nooit hard: zonder
+/// schrijfbare map blijven alleen de console en de geheugenbuffer over.
+pub fn init_file_log() -> Option<PathBuf> {
+    let _ = START.set(Instant::now());
+    let pad = log_path();
+    let _ = LOGPAD.set(pad.clone());
+    let bestand = pad.as_deref().and_then(open);
+    let _ = BESTAND.set(bestand.map(Mutex::new));
+    write_file_line(&format!(
+        "===== Capture {} gestart (pid {}) — {} =====",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        std::env::current_exe()
+            .map(|pad| pad.display().to_string())
+            .unwrap_or_else(|_| "?".into())
+    ));
+    pad
+}
+
+/// Schrijft één regel direct naar het logbestand en flusht. Bewust buiten de
+/// tracing-laag: de panic-hook en de opstartfasen moeten ook kunnen loggen
+/// wanneer tracing nog niet (of niet meer) werkt.
+pub fn write_file_line(regel: &str) {
+    let Some(Some(bestand)) = BESTAND.get() else {
+        return;
+    };
+    // Een panic op een andere thread mag het loggen niet permanent blokkeren.
+    let mut file = bestand.lock().unwrap_or_else(|giftig| giftig.into_inner());
+    let _ = file.write_all(regel.as_bytes());
+    let _ = file.write_all(b"\r\n");
+    let _ = file.flush();
+}
+
+/// Een opstartfase met tijdstip en verstreken tijd sinds het begin. Zo is met
+/// `grep STARTUP` precies te zien waar een start bleef steken of omviel.
+pub fn startup(fase: &str) {
+    write_file_line(&format!(
+        "{}  STARTUP  +{} ms  {fase}",
+        stamp(),
+        since_start()
+    ));
+}
+
+/// Laat een panic (op welke thread dan ook) in het logbestand achter vóór de
+/// oude hook hem naar stderr schrijft — en stderr staat bij `start` op NUL.
+pub fn install_panic_hook() {
+    let vorige = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let tekst = info.to_string().replace('\n', " ");
+        let draad = std::thread::current();
+        let naam = draad.name().unwrap_or("?");
+        write_file_line(&format!("{}  PANIEK   [{naam}] {tekst}", stamp()));
+        vorige(info);
+    }));
+}
+
+fn open(path: &Path) -> Option<File> {
+    let dir = path.parent()?;
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        // Vóór de tracing-init is er nog geen andere plek om dit te melden.
+        eprintln!("logmap {} aanmaken mislukt: {e}", dir.display());
+        return None;
+    }
+    let te_groot = std::fs::metadata(path)
+        .map(|m| m.len() > MAX_BYTES)
+        .unwrap_or(false);
+    if te_groot {
+        let oud = dir.join(OUDE_LOGBESTAND);
+        let _ = std::fs::remove_file(&oud);
+        let _ = std::fs::rename(path, &oud);
+    }
+    OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
+fn stamp() -> String {
+    // UTC, net als de `tracing`-regels die ernaast staan; anders moet je bij
+    // het naast elkaar leggen van een crash twee tijdzones omrekenen.
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+fn since_start() -> u128 {
+    START
+        .get()
+        .map(|start| start.elapsed().as_millis())
+        .unwrap_or(0)
+}
+
 /// Schrijft elke volledige regel naar de buffer, en best-effort ook naar
 /// stderr. Halve regels (een `write` zonder `\n`) wachten in `pending` op
 /// de rest.
@@ -75,6 +195,9 @@ impl Write for TeeHandle {
             let text = text.strip_suffix('\r').unwrap_or(text);
             if !text.trim().is_empty() {
                 self.buffer.push_line(text);
+                // Eerst het bestand: na een crash is dit het enige spoor dat
+                // overblijft (stderr is bij `start` naar NUL gewezen).
+                write_file_line(text);
             }
         }
         let _ = std::io::stderr().write_all(buf);
@@ -204,5 +327,26 @@ mod tests {
         let recent = buf.recent();
         assert_eq!(recent.len(), CAPACITY);
         assert!(recent[0].text.ends_with("regel 10"), "{:?}", recent[0].text);
+    }
+
+    #[test]
+    fn groot_logbestand_schuift_op_naar_capture_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let pad = dir.path().join(LOGBESTAND);
+        std::fs::write(&pad, vec![b'x'; (MAX_BYTES + 1) as usize]).unwrap();
+
+        let file = open(&pad).expect("logbestand openen");
+        drop(file);
+
+        assert!(dir.path().join(OUDE_LOGBESTAND).exists());
+        assert_eq!(std::fs::metadata(&pad).unwrap().len(), 0, "nieuw bestand");
+    }
+
+    #[test]
+    fn zonder_init_is_schrijven_een_noop() {
+        // Tests draaien zonder `init_file_log`; dit mag nooit panieken of in
+        // het echte logbestand van de gebruiker schrijven.
+        write_file_line("2026-09-28T18:58:55Z  INFO test");
+        startup("testfase");
     }
 }

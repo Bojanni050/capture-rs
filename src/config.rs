@@ -520,7 +520,7 @@ impl Config {
 }
 
 /// %LOCALAPPDATA%\Capture (of het platform-equivalent).
-fn app_root() -> Result<PathBuf> {
+pub(crate) fn app_root() -> Result<PathBuf> {
     let base = directories::BaseDirs::new().context("geen home-map gevonden")?;
     let current = base.data_local_dir().join(APP_DIR);
     // Map van vóór de rebrand verhuizen, zodat data, config en frames

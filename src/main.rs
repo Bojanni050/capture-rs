@@ -149,6 +149,24 @@ enum Command {
     },
 }
 
+impl Command {
+    /// Korte naam voor het logbestand; bewust zonder argumenten.
+    fn naam(&self) -> &'static str {
+        match self {
+            Command::Start { .. } => "start",
+            Command::Serve => "serve",
+            Command::Search { .. } => "search",
+            Command::Stats { .. } => "stats",
+            Command::Purge { .. } => "purge",
+            Command::Doctor => "doctor",
+            Command::Config { .. } => "config",
+            Command::Embeddings { .. } => "embeddings",
+            Command::Autostart { .. } => "autostart",
+            Command::Exclude { .. } => "exclude",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum ExcludeCommand {
     /// Toon alles wat is uitgesloten, ook wat Capture zelf leerde.
@@ -202,6 +220,28 @@ enum EmbeddingsCommand {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // Zo vroeg mogelijk: vóór clap, vóór de config en vóór de console
+    // verdwijnt. Zonder terminal (autostart) is dit het enige spoor dat een
+    // crash achterlaat.
+    let _ = logs::init_file_log();
+    logs::install_panic_hook();
+    logs::startup("begin");
+    let result = run().await;
+    match &result {
+        Ok(()) => logs::startup("einde"),
+        Err(e) => {
+            // `{e:#}` houdt de anyhow-context vast: welke fase faalde en waarom.
+            let fout = format!("{e:#}");
+            logs::startup(&format!("afgebroken: {fout}"));
+            tracing::error!(fout = %fout, "afgebroken");
+        }
+    }
+    result
+}
+
+/// De eigenlijke start, zodat `main` élke uitkomst in het logbestand kan
+/// vastleggen — ook wanneer hij met een fout terugkeert.
+async fn run() -> Result<()> {
     // Moet vóór alle andere Win32-aanroepen: zonder dit geeft Windows
     // gevirtualiseerde venstercoördinaten terug op schermen met schaling
     // ≠100%, die niet meer overeenkomen met de fysieke pixels van een
@@ -212,15 +252,32 @@ async fn main() -> Result<()> {
             windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         )
     };
+    logs::startup("dpi-bewustzijn gezet");
 
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // --help, --version en parseerfouten verlaten het proces hier;
+            // zonder deze regel lijkt zo'n korte sessie op een crash.
+            logs::startup(&format!("einde (clap: {:?})", e.kind()));
+            e.exit();
+        }
+    };
+    // Alleen de opdrachtnaam: argumenten kunnen zoektermen met persoonlijke
+    // inhoud bevatten en horen niet in een logbestand.
+    logs::startup(&format!("opdracht: {}", cli.command.naam()));
+
     let log_buffer = logs::LogBuffer::new();
-    init_logging(cli.verbose, &log_buffer);
+    let niveau = init_logging(cli.verbose, &log_buffer);
+    logs::startup(&format!("logging actief (niveau {niveau})"));
 
     // Eenmalig: oude `Chronicle`-opstartregistratie omzetten naar `Capture`.
     autostart::migrate_legacy();
+    logs::startup("autostart-migratie klaar");
 
+    logs::startup("config laden");
     let (cfg, cfg_path) = Config::load(cli.config.as_deref())?;
+    logs::startup(&format!("config geladen: {}", cfg_path.display()));
 
     match cli.command {
         Command::Start {
@@ -286,7 +343,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn init_logging(verbose: u8, buffer: &logs::LogBuffer) {
+fn init_logging(verbose: u8, buffer: &logs::LogBuffer) -> tracing::Level {
     let level = match verbose {
         0 => tracing::Level::INFO,
         1 => tracing::Level::DEBUG,
@@ -298,6 +355,7 @@ fn init_logging(verbose: u8, buffer: &logs::LogBuffer) {
         .with_ansi(std::io::stderr().is_terminal())
         .with_writer(logs::TeeWriter::new(buffer.clone()))
         .init();
+    level
 }
 
 /// Koppelt het proces los van de console. Daarna bezit Capture geen enkel
@@ -367,17 +425,23 @@ async fn cmd_start(
     no_server: bool,
     tray: bool,
     hide_console: bool,
-    logs: logs::LogBuffer,
+    log_buffer: logs::LogBuffer,
 ) -> Result<()> {
     if hide_console {
         detach_console();
+        logs::startup("console losgekoppeld");
     }
     // Moet vóór `open_store` gebeuren: twee `start`-instanties die allebei
     // hun eigen migratie/WAL-initialisatie op dezelfde database doen, is
     // precies wat de database eerder corrumpeerde (zie `lock.rs`).
     let _lock = lock::InstanceLock::acquire(&cfg.lock_path()?)?;
+    logs::startup("instantie-lock verkregen");
 
     let (db, frames) = open_store(&cfg)?;
+    logs::startup(&format!(
+        "database en frames open: {}",
+        cfg.db_path()?.display()
+    ));
 
     // Gedeelde momentopname voor de webinterface (`/api/status`): alles wat
     // je anders in de terminal zou aflezen.
@@ -386,15 +450,27 @@ async fn cmd_start(
 
     // Bouw server state mét embeddings store (optioneel) voor API.
     let embeddings_store = if cfg.embeddings.enabled {
+        logs::startup("embeddings-store bouwen");
         Some(embeddings::make_store(&cfg))
     } else {
         None
     };
     let embeddings_provider = if cfg.embeddings.enabled {
+        // Dit laadt (of downloadt) een fastembed-model en start ONNX; een
+        // crash hier wijst naar de embeddings-kant, niet naar de opname.
+        logs::startup("embeddings-model laden");
         Some(embeddings::make_provider(&cfg).await)
     } else {
         None
     };
+    logs::startup(&format!(
+        "embeddings {}",
+        if cfg.embeddings.enabled {
+            "geladen"
+        } else {
+            "uit"
+        }
+    ));
 
     if !no_server && cfg.server.enabled {
         let state = server::AppState {
@@ -403,11 +479,17 @@ async fn cmd_start(
             embeddings_store: embeddings_store.clone(),
             embeddings_provider: embeddings_provider.clone(),
             status: Arc::clone(&shared_status),
-            logs: logs.clone(),
+            logs: log_buffer.clone(),
         };
         match server::serve(state, &cfg.server.bind, cfg.server.port).await {
-            Ok(addr) => tracing::info!("webinterface op http://{addr}"),
-            Err(e) => tracing::error!(error = %e, "webserver kon niet starten"),
+            Ok(addr) => {
+                tracing::info!("webinterface op http://{addr}");
+                logs::startup(&format!("webinterface op http://{addr}"));
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "webserver kon niet starten");
+                logs::startup(&format!("webserver kon niet starten: {e:#}"));
+            }
         }
     }
 
@@ -423,6 +505,7 @@ async fn cmd_start(
                 tracing::warn!(error = %e, "embeddings indexer gestopt met fout");
             }
         });
+        logs::startup("embeddings-indexer gestart");
         Some((handle, idx_tx))
     } else {
         None
@@ -434,6 +517,7 @@ async fn cmd_start(
     // De bridge draait los van `--no-server`: de extensie heeft hem nodig, ook
     // als je de webinterface niet wilt.
     let browser_state = if cfg.browser.enabled {
+        logs::startup("browser-bridge starten");
         let state = Arc::new(browser::BrowserState::default());
         match browser::serve(Arc::clone(&state), cfg.browser.port).await {
             Ok(addr) => {
@@ -455,6 +539,7 @@ async fn cmd_start(
     };
 
     let shipper_handle = cfg.ship.enabled.then(|| {
+        logs::startup("shipper gestart");
         tokio::spawn(ship::run(
             cfg.ship.clone(),
             Arc::clone(&db),
@@ -463,6 +548,7 @@ async fn cmd_start(
         ))
     });
 
+    logs::startup("pipeline bouwen");
     let mut pipeline = pipeline::Pipeline::new(cfg, Arc::clone(&db), Arc::clone(&frames))?;
     pipeline.attach_status(Arc::clone(&shared_status));
     server::set_pipeline_info(
@@ -475,6 +561,7 @@ async fn cmd_start(
         pipeline.attach_browser(state);
     }
     tracing::info!(schermen = %pipeline.monitors(), "opname gestart — Ctrl+C om te stoppen");
+    logs::startup(&format!("pipeline klaar: {}", pipeline.monitors()));
 
     let ctrlc_tx = tx.clone();
     tokio::spawn(async move {
@@ -488,7 +575,20 @@ async fn cmd_start(
         pipeline.attach_tray(status);
     }
 
+    // Een harde crash (heap-corruptie) geeft geen panic en geen exit-regel.
+    // Deze ene regel maakt achteraf het verschil tussen "viel na 20 s om" en
+    // "draaide door": hij komt alleen als het proces de eerste minuut haalt.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        logs::startup("60 s na start — draait nog");
+    });
+
+    logs::startup("opnamelus begint");
     let res = pipeline.run(rx).await;
+    match &res {
+        Ok(()) => logs::startup("opnamelus gestopt"),
+        Err(e) => logs::startup(&format!("opnamelus gestopt met fout: {e:#}")),
+    }
 
     if let Some(handle) = shipper_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
@@ -503,14 +603,16 @@ async fn cmd_start(
     res
 }
 
-async fn cmd_serve(cfg: Config, logs: logs::LogBuffer) -> Result<()> {
+async fn cmd_serve(cfg: Config, log_buffer: logs::LogBuffer) -> Result<()> {
     let (db, frames) = open_store(&cfg)?;
+    logs::startup("serve: database en frames open");
     let embeddings_store = if cfg.embeddings.enabled {
         Some(embeddings::make_store(&cfg))
     } else {
         None
     };
     let embeddings_provider = if cfg.embeddings.enabled {
+        logs::startup("serve: embeddings-model laden");
         Some(embeddings::make_provider(&cfg).await)
     } else {
         None
@@ -523,9 +625,10 @@ async fn cmd_serve(cfg: Config, logs: logs::LogBuffer) -> Result<()> {
         // Alleen de webinterface: er draait geen opname, dus de status
         // blijft op de config-waarden (uia_active=false, geen schermen).
         status: Arc::new(RwLock::new(server::SystemStatus::new(&cfg, false))),
-        logs,
+        logs: log_buffer,
     };
     let addr = server::serve(state, &cfg.server.bind, cfg.server.port).await?;
+    logs::startup(&format!("serve: webinterface op http://{addr}"));
     println!("Webinterface draait op http://{addr} — Ctrl+C om te stoppen.");
     tokio::signal::ctrl_c().await?;
     Ok(())
@@ -777,6 +880,18 @@ fn cmd_doctor(cfg: Config, cfg_path: &std::path::Path) -> Result<()> {
 
     let data_dir = cfg.resolved_data_dir()?;
     println!("Datamap          {}", data_dir.display());
+
+    match logs::log_path() {
+        Some(pad) => {
+            let grootte = std::fs::metadata(&pad).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "Logbestand       {} ({:.1} KB)",
+                pad.display(),
+                grootte as f64 / 1024.0
+            );
+        }
+        None => println!("Logbestand       (geen schrijfbare map gevonden)"),
+    }
 
     let db_path = cfg.db_path()?;
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);

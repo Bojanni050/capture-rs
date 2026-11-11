@@ -261,6 +261,22 @@ wat er nu staat.
 `doctor` probeert UIA op al je open vensters én doet een echte OCR-proefopname,
 met tijden erbij — de snelste manier om je drempels te ijken.
 
+## Logbestand
+
+Elke start schrijft naar `%LOCALAPPDATA%\Capture\logs\capture.log`, ook
+wanneer er geen terminal is (autostart, `--hide-console`). Elke regel gaat
+direct naar schijf, dus ook na een harde crash staat de laatste regel er nog:
+
+```bash
+grep STARTUP "$LOCALAPPDATA/Capture/logs/capture.log"   # fasen van elke start
+```
+
+De `STARTUP`-regels markeren de fasen (config, lock, database, server,
+embeddings, pipeline) met een `+N ms`-tijd sinds het begin. Een sessie zonder
+`einde`-regel is niet netjes gestopt; panics staan er als `PANIEK`. Het
+bestand groeit tot 5 MB en schuift dan bij de volgende start op naar
+`capture.1.log`. `capture doctor` toont het pad en de grootte.
+
 ## Configuratie
 
 `capture config --init` schrijft alle defaults naar
@@ -406,7 +422,8 @@ Standaard blijft alles lokaal: SQLite en JPEG's onder
 `%LOCALAPPDATA%\Capture\data`. Er gaat niets naar buiten en er zit geen
 telemetrie in. De enige uitzondering is de shipper (`[ship] enabled = true`),
 die uit staat tot jij hem aanzet en dan alleen gefilterde tekst naar Foundation
-stuurt.
+stuurt. Het logbestand (`%LOCALAPPDATA%\Capture\logs`) bevat app-namen, paden
+en foutmeldingen — geen scherminhoud.
 
 Wat je zelf moet weten: dit legt vast wat er op je scherm staat. De denylist en
 de redactie vangen de voor de hand liggende gevallen af, maar niet alles.
