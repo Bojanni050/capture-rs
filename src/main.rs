@@ -277,7 +277,16 @@ async fn run() -> Result<()> {
 
     logs::startup("config laden");
     let (cfg, cfg_path) = Config::load(cli.config.as_deref())?;
-    logs::startup(&format!("config geladen: {}", cfg_path.display()));
+    if cfg_path.exists() {
+        logs::startup(&format!("config geladen: {}", cfg_path.display()));
+    } else {
+        // Geen bestand is geen fout: dan gelden de defaults. Wel eerlijk
+        // loggen, anders lijkt het of er iets geladen is wat niet bestaat.
+        logs::startup(&format!(
+            "geen configbestand, standaardwaarden actief: {}",
+            cfg_path.display()
+        ));
+    }
 
     match cli.command {
         Command::Start {
