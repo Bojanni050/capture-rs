@@ -213,6 +213,7 @@ doet.
 ## Gebruik
 
 ```bash
+capture                     # start de opname (zelfde als `capture start`)
 capture doctor              # controleer uia per app, OCR, schermen, database
 capture start               # opnemen + webinterface + tray-icoon, helemaal los van de console
 capture start --show-console --no-tray  # klassiek: alles in de terminal

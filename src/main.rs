@@ -48,8 +48,10 @@ struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 
+    /// Welke opdracht; zonder opdracht start Capture de opname, zodat een
+    /// dubbelklik op capture.exe gewoon werkt.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -263,9 +265,29 @@ async fn run() -> Result<()> {
             e.exit();
         }
     };
+    // Zonder subcommando starten we de opname: een dubbelklik op
+    // capture.exe hoort gewoon te werken, niet met een usage-melding te
+    // eindigen.
+    let impliciet_start = cli.command.is_none();
+    let command = cli.command.unwrap_or(Command::Start {
+        no_server: false,
+        tray: false,
+        no_tray: false,
+        hide_console: false,
+        show_console: false,
+    });
+
     // Alleen de opdrachtnaam: argumenten kunnen zoektermen met persoonlijke
     // inhoud bevatten en horen niet in een logbestand.
-    logs::startup(&format!("opdracht: {}", cli.command.naam()));
+    logs::startup(&format!(
+        "opdracht: {}{}",
+        command.naam(),
+        if impliciet_start {
+            " (zonder subcommando)"
+        } else {
+            ""
+        }
+    ));
 
     let log_buffer = logs::LogBuffer::new();
     let niveau = init_logging(cli.verbose, &log_buffer);
@@ -288,7 +310,7 @@ async fn run() -> Result<()> {
         ));
     }
 
-    match cli.command {
+    match command {
         Command::Start {
             no_server,
             tray,
@@ -1602,16 +1624,27 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.command,
-            Command::Search {
+            Some(Command::Search {
                 json: true,
                 full: true,
                 semantic: true,
                 ..
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["capture", "stats", "--json"]).unwrap();
-        assert!(matches!(cli.command, Command::Stats { json: true, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Stats { json: true, .. })
+        ));
+    }
+
+    #[test]
+    fn zonder_subcommando_blijft_het_commando_leeg() {
+        // `run` vult dat in als `start`; hier alleen dat clap niet met een
+        // usage-fout stopt, want dat maakte van een dubbelklik een crash.
+        let cli = Cli::try_parse_from(["capture"]).unwrap();
+        assert!(cli.command.is_none());
     }
 
     #[test]
