@@ -184,10 +184,10 @@ zichtbaar venster wordt apart bijgesneden en gelezen, met zijn eigen app en
 titel. Wat er in de z-order bovenop zo'n venster ligt (een dialoog, een
 zwevend paneel, de taakbalk) wordt eerst wit gemaskeerd, zodat die pixels niet
 aan het onderliggende venster worden toegeschreven. Vensters die zelf niets
-meer laten zien — volledig bedekt, geminimaliseerd, DWM-cloaked, of een
-shell-venster zoals de taakbalk — worden overgeslagen. Ook hier geldt de
-minimale oppervlakte-eis: een strookje van een paar pixels levert geen capture
-op.
+meer laten zien — volledig bedekt, geminimaliseerd, DWM-cloaked, doorklikbaar
+overlay (cursor, OSD) of een shell-venster zoals de taakbalk — worden
+overgeslagen. Ook hier geldt de minimale oppervlakte-eis: een strookje van een
+paar pixels levert geen capture op.
 
 Elk venster houdt zijn eigen beeldhash, tekstgeheugen en segment, dus twee
 vensters van dezelfde app (twee Explorer-vensters, twee terminals) beïnvloeden

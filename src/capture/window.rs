@@ -11,8 +11,8 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    EnumWindows, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetWindowLongW, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, WS_EX_TRANSPARENT,
 };
 use windows::core::BOOL;
 use windows::core::PWSTR;
@@ -199,6 +199,8 @@ pub struct StackedWindow {
 /// zonder titel: anders zou de strook eronder als inhoud van het venster
 /// erachter gelezen worden. Geminimaliseerde en door DWM verborgen vensters
 /// (geparkeerde UWP-apps) doen niet mee — die hebben geen pixels op het scherm.
+/// Voor doorklikbare overlays geldt hetzelfde: die horen bij geen enkele app en
+/// bedekken niets, ook al strekt hun rechthoek zich over het hele scherm uit.
 pub fn stacked_windows() -> Vec<StackedWindow> {
     let mut found: Vec<StackedWindow> = Vec::new();
     unsafe {
@@ -216,6 +218,7 @@ unsafe extern "system" fn collect_stacked(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if !unsafe { IsWindowVisible(hwnd) }.as_bool()
         || unsafe { IsIconic(hwnd) }.as_bool()
         || is_cloaked(hwnd)
+        || is_click_through(hwnd)
     {
         return true.into();
     }
@@ -255,6 +258,18 @@ pub fn is_shell_window(class: &str) -> bool {
 
 /// Heeft DWM dit venster verstopt? Geparkeerde UWP-apps (`IsWindowVisible`
 /// zegt ja) leveren dan geen pixels en horen niet in de stapel.
+/// Is dit een doorklikbaar overlay-venster (cursor-overlays, OSD's)?
+///
+/// `WS_EX_TRANSPARENT` laat muisklikken door naar wat eronder ligt en wordt in
+/// de praktijk alleen door overlays gebruikt. Zulke vensters hebben geen
+/// inhoud die bij een app hoort, en — belangrijker — ze mogen niet als
+/// bedekker tellen: een transparant schermvullend overlay zou anders alles wat
+/// eronder staat als "volledig bedekt" wegfilteren.
+fn is_click_through(hwnd: HWND) -> bool {
+    let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+    ex & WS_EX_TRANSPARENT.0 != 0
+}
+
 fn is_cloaked(hwnd: HWND) -> bool {
     let mut cloaked: u32 = 0;
     let result = unsafe {
