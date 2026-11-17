@@ -4,15 +4,17 @@
 //! bepaalt of we überhaupt een screenshot hoeven te maken.
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT};
-use windows::core::BOOL;
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
+};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible,
 };
+use windows::core::BOOL;
 use windows::core::PWSTR;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,42 +109,42 @@ pub fn foreground_hwnd() -> isize {
 /// Het actieve venster, of `None` als er geen bruikbare voorgrond is
 /// (vergrendeld scherm, alt-tab-overlay, net van bureaublad gewisseld).
 pub fn foreground() -> Option<WindowInfo> {
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_invalid() {
-            return None;
-        }
-
-        let mut buf = [0u16; 512];
-        let len = GetWindowTextW(hwnd, &mut buf);
-        let title = if len > 0 {
-            String::from_utf16_lossy(&buf[..len as usize])
-        } else {
-            String::new()
-        };
-
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == 0 {
-            return None;
-        }
-
-        // Lukt de naamvraag niet (verhoogd proces, SYSTEM), dan is er geen
-        // app-naam om aan een denylist te toetsen. Zo'n venster teruggeven
-        // zou het langs elke uitsluiting laten glippen, dus melden we het
-        // als "geen bruikbaar venster" — de volgende tik probeert opnieuw.
-        let Some((exe_path, exe)) = process_image(pid) else {
-            return None;
-        };
-
-        Some(WindowInfo {
-            title,
-            exe,
-            exe_path,
-            pid,
-            hwnd: hwnd.0 as isize,
-        })
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid() {
+        return None;
     }
+    window_info(hwnd)
+}
+
+/// Titel, proces en handvat van één venster.
+///
+/// `None` als er geen bruikbare app-naam is of het venster al weg is. Lukt de
+/// naamvraag niet (verhoogd proces, SYSTEM), dan is er niets om aan een
+/// denylist te toetsen; zo'n venster teruggeven zou het langs elke uitsluiting
+/// laten glippen, dus melden we het als "geen bruikbaar venster".
+fn window_info(hwnd: HWND) -> Option<WindowInfo> {
+    let mut buf = [0u16; 512];
+    let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
+    let title = if len > 0 {
+        String::from_utf16_lossy(&buf[..len as usize])
+    } else {
+        String::new()
+    };
+
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid == 0 {
+        return None;
+    }
+
+    let (exe_path, exe) = process_image(pid)?;
+    Some(WindowInfo {
+        title,
+        exe,
+        exe_path,
+        pid,
+        hwnd: hwnd.0 as isize,
+    })
 }
 
 /// Alle zichtbare vensters met een titel.
@@ -169,32 +171,111 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
         return true.into();
     }
 
-    let mut buf = [0u16; 512];
-    let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
-    if len <= 0 {
-        return true.into();
-    }
-    let title = String::from_utf16_lossy(&buf[..len as usize]);
-
-    let mut pid: u32 = 0;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    if pid == 0 {
-        return true.into();
-    }
-
-    // Zonder procesnaam is er niets waar `doctor` zinnig mee kan toetsen.
-    let Some((exe_path, exe)) = process_image(pid) else {
+    // Zonder titel is er niets waar `doctor` zinnig mee kan toetsen.
+    let Some(info) = window_info(hwnd) else {
         return true.into();
     };
-    out.push(WindowInfo {
-        title,
-        exe,
-        exe_path,
-        pid,
-        hwnd: hwnd.0 as isize,
-    });
+    if info.title.is_empty() {
+        return true.into();
+    }
+    out.push(info);
 
     true.into()
+}
+
+/// Een zichtbaar venster op zijn huidige plek, in z-order.
+#[derive(Debug, Clone)]
+pub struct StackedWindow {
+    pub info: WindowInfo,
+    pub rect: Rect,
+    /// Vensterklasse, bv. "Chrome_WidgetWin_1" of "Shell_TrayWnd".
+    pub class: String,
+}
+
+/// Alle zichtbare vensters van boven naar beneden, met hun rechthoek.
+///
+/// Anders dan `top_level_windows` (dat `doctor` voedt) gaat het hier om de
+/// stapel zoals je hem ziet. De taakbalk telt mee als bedekkend venster, ook
+/// zonder titel: anders zou de strook eronder als inhoud van het venster
+/// erachter gelezen worden. Geminimaliseerde en door DWM verborgen vensters
+/// (geparkeerde UWP-apps) doen niet mee — die hebben geen pixels op het scherm.
+pub fn stacked_windows() -> Vec<StackedWindow> {
+    let mut found: Vec<StackedWindow> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(collect_stacked),
+            LPARAM(&mut found as *mut Vec<StackedWindow> as isize),
+        );
+    }
+    found
+}
+
+unsafe extern "system" fn collect_stacked(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let out = unsafe { &mut *(lparam.0 as *mut Vec<StackedWindow>) };
+
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool()
+        || unsafe { IsIconic(hwnd) }.as_bool()
+        || is_cloaked(hwnd)
+    {
+        return true.into();
+    }
+
+    let class = class_name(hwnd);
+    let shell = is_shell_window(&class);
+
+    // Van titelloze vensters nemen we alleen de schil mee: de taakbalk bedekt
+    // wel, maar is nooit inhoud. Alle andere titelloze vensters zijn hulpjes,
+    // tooltips of verborgen overlays.
+    let Some(info) = window_info(hwnd) else {
+        return true.into();
+    };
+    if info.title.is_empty() && !shell {
+        return true.into();
+    }
+
+    let Some(rect) = window_rect(hwnd.0 as isize) else {
+        return true.into();
+    };
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return true.into();
+    }
+
+    out.push(StackedWindow { info, rect, class });
+    true.into()
+}
+
+/// De schil van Windows zelf: bureaublad en taakbalk. Nooit inhoud, maar wel
+/// iets dat een strook van de vensters eronder bedekt.
+pub fn is_shell_window(class: &str) -> bool {
+    matches!(
+        class,
+        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+    )
+}
+
+/// Heeft DWM dit venster verstopt? Geparkeerde UWP-apps (`IsWindowVisible`
+/// zegt ja) leveren dan geen pixels en horen niet in de stapel.
+fn is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked: u32 = 0;
+    let result = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    result.is_ok() && cloaked != 0
+}
+
+fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+    if len > 0 {
+        String::from_utf16_lossy(&buf[..len as usize])
+    } else {
+        String::new()
+    }
 }
 
 /// (volledig pad, bestandsnaam in kleine letters) van een proces.

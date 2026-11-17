@@ -132,6 +132,9 @@ pub struct UiaConfig {
     pub retry_after_secs: u64,
     /// Apps waarvoor we UIA nooit proberen (kleine letters, zonder .exe).
     pub app_denylist: Vec<String>,
+    /// Ook vensters op de andere schermen via UIA lezen. Uit = daar OCR, wat
+    /// voorspelbaar is in tijd maar pixels leest in plaats van tekens.
+    pub secondary: bool,
 }
 
 impl Default for UiaConfig {
@@ -160,6 +163,10 @@ impl Default for UiaConfig {
             // die app. `timeout_ms` beschermt Capture, niet de app aan de andere
             // kant. OCR leest dit venster gewoon.
             app_denylist: vec!["everything".into()],
+            // Een achtergrondvenster kost net als een voorgrondvenster één
+            // UIA-lezing (250-2500 ms), maar alleen als het beeld wijzigde.
+            // Staat dit in de weg, dan leest OCR de bijvangst.
+            secondary: true,
         }
     }
 }
@@ -448,7 +455,8 @@ impl Config {
             if self.embeddings.batch_size == 0 || self.embeddings.batch_size > 512 {
                 return Err(anyhow!("embeddings.batch_size moet 1..512 zijn"));
             }
-            if self.embeddings.max_content_chars < 100 || self.embeddings.max_content_chars > 20000 {
+            if self.embeddings.max_content_chars < 100 || self.embeddings.max_content_chars > 20000
+            {
                 return Err(anyhow!("embeddings.max_content_chars moet 100..20000 zijn"));
             }
         }

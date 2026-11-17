@@ -155,32 +155,55 @@ capture exclude add app slack
 capture exclude remove domain github.com   # bv. als het te grof bleek
 ```
 
-Beperking: bij `monitor = "all"` staat UIA uit (zie hieronder), dus dan is er
-geen wachtwoordveld-detectie via UIA; alleen de browserextensie en de denylists
-werken dan nog.
+Bij `monitor = "all"` geldt de wachtwoordveld-detectie via UIA alleen voor het
+venster op het leidende scherm: de browserextensie rapporteert immers alleen het
+actieve tabblad, en een wachtwoordveld in een venster op een ander scherm is per
+definitie niet het actieve tabblad. Zet `uia.secondary = false` als je op de
+bijvangst-schermen helemaal geen UIA wilt.
 
-## Alleen het voorgrondvenster, nooit wat eromheen staat
+## Welke pixels, en van welk venster
 
 Een screenshot van het hele scherm laat ook zien wat er ván een niet-
 gemaximaliseerd venster nog zichtbaar is — een ander tabblad, een chatvenster
 op de achtergrond, een sidebar. Zonder maatregel zou dat allemaal door OCR
 gehaald en aan de verkeerde app toegeschreven worden.
 
-Daarom snijdt Capture elke screenshot vóór OCR (en vóór een eventueel bewaard
-beeld) bij tot het zichtbare rechthoek van het voorgrondvenster
+Capture werkt daarom in twee lagen:
+
+**Het leidende scherm** is het scherm waar het voorgrondvenster staat. Daar
+snijdt Capture de screenshot bij tot de zichtbare rechthoek van dat ene venster
 (`DwmGetWindowAttribute`/`DWMWA_EXTENDED_FRAME_BOUNDS`, met `GetWindowRect` als
 terugval). Dat rechthoek wordt vlak vóór de screenshot opgevraagd, en er komt
 een re-check ná de screenshot: wisselde het voorgrondvenster ondertussen, dan
 wordt die tik overgeslagen in plaats van een verouderde rechthoek op de
-verkeerde pixels toe te passen. Bij meerdere schermen (`monitor = "all"`)
-betekent dit ook dat een scherm waar het venster niet op staat helemaal niet
-meer meegelezen wordt.
+verkeerde pixels toe te passen. Wat er op dat scherm om het venster heen staat
+wordt niet gelezen.
 
-**UI Automation heeft dit probleem structureel niet** — het leest de
-accessibility-boom die geworteld is in één specifiek venster, dus content van
-een ander venster kan daar nooit in lekken. De bijsnijding is dus vooral van
-belang voor de OCR-fallback, en voor de beeld-fallback wanneer die wordt
-opgeslagen.
+**De overige schermen** zijn bijvangst, en daarvan wordt niets weggegooid: elk
+zichtbaar venster wordt apart bijgesneden en gelezen, met zijn eigen app en
+titel. Wat er in de z-order bovenop zo'n venster ligt (een dialoog, een
+zwevend paneel, de taakbalk) wordt eerst wit gemaskeerd, zodat die pixels niet
+aan het onderliggende venster worden toegeschreven. Vensters die zelf niets
+meer laten zien — volledig bedekt, geminimaliseerd, DWM-cloaked, of een
+shell-venster zoals de taakbalk — worden overgeslagen. Ook hier geldt de
+minimale oppervlakte-eis: een strookje van een paar pixels levert geen capture
+op.
+
+Elk venster houdt zijn eigen beeldhash, tekstgeheugen en segment, dus twee
+vensters van dezelfde app (twee Explorer-vensters, twee terminals) beïnvloeden
+elkaar niet en verschijnen als aparte segmenten in de tijdlijn.
+
+**Privacy gaat vóór volledigheid**: wijst de poort (idle, denylist,
+uitsluiting) het voorgrondvenster af, dan wordt de hele tik overgeslagen — ook
+de bijvangst-schermen. Staat er een wachtwoordveld in het voorgrondvenster, dan
+stopt de tik daar en worden de overige vensters niet meer verwerkt; op een
+bijvangst-scherm sluit alleen dat ene venster zijn segment.
+
+**UI Automation** leest de accessibility-boom die geworteld is in één specifiek
+venster, dus content van een ander venster kan daar nooit in lekken. Het is
+daarom de primaire bron op het leidende scherm én op de bijvangst-schermen; OCR
+is de terugval, bijvoorbeeld wanneer UIA te weinig tekst teruggeeft of voor die
+app tijdelijk is uitgeschakeld.
 
 Dit vereist dat Capture per-monitor DPI-bewust is (`main.rs` zet dit bij het
 opstarten) — zonder dat geeft Windows geschaalde coördinaten terug die niet
@@ -298,6 +321,7 @@ timeout_ms = 2500            # daarna gaat OCR verder; de boom mag doorwerken
 failures_before_skip = 3     # daarna gaat uia voor die app tijdelijk uit
 retry_after_secs = 600       # en krijgt hij daarna weer een kans
 app_denylist = ["everything"] # apps waarvoor je uia nooit wilt proberen
+secondary = true             # ook vensters op bijvangst-schermen via uia lezen
 
 [ocr]
 min_text_len = 24          # minder tekens dan dit → beeld-fallback
@@ -325,11 +349,12 @@ retention_days = 45        # alles ouder dan dit verdwijnt
 frame_retention_days = 10  # afbeeldingen eerder, tekst blijft langer
 ```
 
-Bij `monitor = "all"` behandelt Capture elk scherm als een eigen bron: elk
-frame krijgt eerst zijn eigen beeldhash en tekstvergelijking. UI Automation
-beschrijft alleen het voorgrondvenster en wordt daarom alleen gebruikt wanneer
-één monitor is geselecteerd; bij een multischerm-opname leest OCR de schermen
-apart. Zo kan tekst op één scherm een tweede scherm niet wegfilteren.
+Bij `monitor = "all"` behandelt Capture elk scherm als een eigen bron. Het scherm
+waar het voorgrondvenster staat is leidend: daarvan wordt alleen dat venster
+gelezen, met UIA. Op de andere schermen krijgt elk zichtbaar venster een eigen
+bijsnijding, een eigen beeldhash en tekstvergelijking, en een eigen segment. Zo
+kan tekst op één scherm een tweede scherm niet wegfilteren, en komt tekst ook
+niet bij de verkeerde app terecht.
 
 Retentie draait automatisch elk uur terwijl `start` loopt.
 

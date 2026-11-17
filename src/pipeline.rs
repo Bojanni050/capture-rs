@@ -27,8 +27,8 @@
 
 use crate::browser::BrowserState;
 use crate::capture::{
-    ForegroundEvents, Rect, ScreenCapturer, WindowInfo, foreground, foreground_hwnd, idle_seconds,
-    window_rect,
+    ForegroundEvents, Rect, ScreenCapturer, Shot, WindowInfo, foreground, foreground_hwnd,
+    idle_seconds, is_shell_window, stacked_windows, window_rect,
 };
 use crate::config::{Config, FramePolicy};
 use crate::filter::{Gate, NoiseFilter, dedupe};
@@ -54,11 +54,17 @@ const FOREGROUND_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Tikken die langer duren dan dit worden op info-niveau gelogd, zodat zichtbaar
 /// wordt wat een opname (UIA/OCR/screenshot) kost.
 const SLOW_TICK: Duration = Duration::from_millis(1_000);
+/// Hoeveel pixels van een venster er op een scherm zichtbaar moeten zijn
+/// voordat we het als aparte capture lezen. Kleinere restjes leveren vooral
+/// OCR-ruis van de buren op.
+const MIN_WINDOW_PIXELS: u64 = 12_000;
 
 struct Segment {
     id: i64,
-    app_key: String,
-    title: String,
+    /// Laatste tik waarin dit segment nog inhoud kreeg. Een segment dat een
+    /// tik niet meer gezien is, eindigt hier — net als een voorgrondvenster
+    /// dat je wegklikt.
+    last_seen: i64,
 }
 
 /// Welke laag de tekst uiteindelijk leverde.
@@ -108,7 +114,9 @@ pub struct Pipeline {
     ocr: Option<OcrService>,
     filter: NoiseFilter,
     capturer: ScreenCapturer,
-    segment: Option<Segment>,
+    /// Eén segment per app+titel. Op een tweede scherm staat vaak een ander
+    /// venster dan op het eerste, dus één "huidig segment" is niet genoeg.
+    segments: HashMap<String, Segment>,
     app_ids: HashMap<String, i64>,
     ticks: u64,
     last_hwnd: Option<isize>,
@@ -167,7 +175,7 @@ impl Pipeline {
             ocr,
             filter,
             capturer,
-            segment: None,
+            segments: HashMap::new(),
             app_ids: HashMap::new(),
             ticks: 0,
             last_hwnd: None,
@@ -191,7 +199,7 @@ impl Pipeline {
             ocr: None,
             filter,
             capturer: ScreenCapturer::for_test(),
-            segment: None,
+            segments: HashMap::new(),
             app_ids: HashMap::new(),
             ticks: 0,
             last_hwnd: None,
@@ -366,16 +374,16 @@ impl Pipeline {
         {
             self.record_skip(&now.format("%Y-%m-%d").to_string(), reason.as_str())?;
             // Een lopend segment eindigt zodra je iets anders gaat doen.
-            self.segment = None;
+            self.segments.clear();
             return Ok(());
         }
         let window = window.expect("gate laat None niet door");
 
         let app_key = window.app_key();
 
-        if let Some(reason) = self.excluded_reason(&window, &app_key)? {
+        if let Some(reason) = self.excluded_reason(&window, &app_key, true)? {
             self.record_skip(&now.format("%Y-%m-%d").to_string(), reason)?;
-            self.segment = None;
+            self.segments.clear();
             return Ok(());
         }
 
@@ -430,59 +438,135 @@ impl Pipeline {
             self.last_hwnd = Some(window.hwnd);
         }
 
-        // Elke shot bijsnijden tot het zichtbare rechthoek van het
-        // voorgrondvenster (opgehaald vlak vóór de screenshot hierboven):
-        // beperkt de kans dat andere vensters in OCR, de beeldhash of een
-        // bewaard beeld terechtkomen. Dit is geen occlusie-masker: een
-        // always-on-top pop-up binnen dezelfde rechthoek is nog zichtbaar.
-        // Kunnen we de grenzen niet bepalen (DWM weigert), dan gebruiken we
-        // liever de hele shot dan de capture over te slaan.
-        for shot in shots {
-            let image = match win_rect {
-                Some(rect) => match crop_to_window(&shot.image, shot.x, shot.y, rect) {
-                    Some(cropped) => cropped,
-                    None => {
-                        // Het voorgrondvenster raakt dit scherm niet — hier
-                        // is niets van te zien, dus geen zin in OCR erop.
-                        tracing::trace!(monitor = %shot.monitor, "venster niet op dit scherm");
-                        continue;
-                    }
-                },
-                None => shot.image,
-            };
+        // Het scherm waar het voorgrondvenster staat is leidend: daar bepaalt
+        // dat venster wat er gelezen wordt. Schermen die het venster niet
+        // raakt zijn bijvangst: daar lezen we elk zichtbaar venster apart, met
+        // een eigen app, titel en segment. Zo kost een tweede monitor geen
+        // informatie, maar schrijven we zijn inhoud ook niet aan de verkeerde
+        // app toe.
+        let lead: Vec<usize> = match win_rect {
+            Some(rect) => shots
+                .iter()
+                .enumerate()
+                .filter(|(_, shot)| overlaps(shot.rect(), rect))
+                .map(|(idx, _)| idx)
+                .collect(),
+            // Geen geometrie (DWM weigert): lees het eerste scherm volledig,
+            // zoals voorheen, in plaats van de capture over te slaan.
+            None => (0..shots.len().min(1)).collect(),
+        };
 
+        for (idx, shot) in shots.iter().enumerate() {
+            if lead.contains(&idx) {
+                let Some((image, origin)) = lead_frame(shot, win_rect) else {
+                    continue;
+                };
+
+                let password_found = self
+                    .process_frame(
+                        FrameContext {
+                            segment_id,
+                            app_key: &app_key,
+                            title: &window.title,
+                            hwnd: window.hwnd,
+                            monitor: &shot.monitor,
+                            ts,
+                            now: &now,
+                        },
+                        image,
+                        origin,
+                        true,
+                    )
+                    .await?;
+                if password_found {
+                    // Geen tweede scherm van dit venster meer lezen.
+                    break;
+                }
+                continue;
+            }
+
+            self.capture_screen_windows(shot, window.hwnd, ts, &now)
+                .await?;
+        }
+
+        // Alleen wat deze tik nog gezien is blijft open; de rest eindigt hier.
+        self.segments.retain(|_, seg| seg.last_seen >= ts);
+
+        if self.ticks.is_multiple_of(FLUSH_EVERY) {
+            self.flush_boilerplate()?;
+        }
+        Ok(())
+    }
+
+    /// Leest elk zichtbaar venster op een scherm waar het voorgrondvenster
+    /// niet staat. Elk venster wordt apart bijgesneden, gemaskeerd voor wat
+    /// er bovenop ligt, en krijgt zijn eigen app, titel en segment.
+    async fn capture_screen_windows(
+        &mut self,
+        shot: &Shot,
+        foreground_hwnd: isize,
+        ts: i64,
+        now: &chrono::DateTime<Local>,
+    ) -> Result<()> {
+        let screen = shot.rect();
+        // Eén enumeratie per scherm: de z-order is de volgorde van EnumWindows
+        // en bepaalt zowel wie er bovenop ligt als wie er nog zichtbaar is.
+        let windows = stacked_windows();
+
+        for (idx, win) in windows.iter().enumerate() {
+            if win.info.hwnd == foreground_hwnd {
+                continue;
+            }
+            if win.info.title.is_empty() || is_shell_window(&win.class) {
+                continue;
+            }
+            if !self.filter.window_allowed(&win.info) {
+                continue;
+            }
+
+            let occluders: Vec<Rect> = windows[..idx].iter().map(|w| w.rect).collect();
+            if visible_area(win.rect, screen, &occluders) < MIN_WINDOW_PIXELS {
+                // Te weinig van dit venster in beeld: OCR zou vooral de buren
+                // lezen, en een bewaard beeld zou hen vastleggen.
+                continue;
+            }
+
+            let app_key = win.info.app_key();
+            if let Some(reason) = self.excluded_reason(&win.info, &app_key, false)? {
+                tracing::trace!(app = app_key, reden = reason, "venster overgeslagen");
+                continue;
+            }
+
+            let Some(mut image) = crop_to_window(&shot.image, shot.x, shot.y, win.rect) else {
+                continue;
+            };
             // Oorsprong van het bijgesneden beeld in virtuele-schermpixels.
-            // UIA geeft rechthoeken in diezelfde ruimte; zonder deze
-            // vertaling zou een masker op een tweede monitor of bij een
-            // deels buiten beeld staand venster op de verkeerde plek vallen.
-            let origin = match win_rect {
-                Some(rect) => (rect.left.max(shot.x), rect.top.max(shot.y)),
-                None => (shot.x, shot.y),
-            };
+            let origin = (win.rect.left.max(shot.x), win.rect.top.max(shot.y));
+            mask_rects(&mut image, origin, &occluders);
 
+            let app_id = self.app_id(&win.info)?;
+            let segment_id = self.segment_for(app_id, &app_key, &win.info.title, ts)?;
             let password_found = self
                 .process_frame(
                     FrameContext {
                         segment_id,
                         app_key: &app_key,
-                        title: &window.title,
-                        hwnd: window.hwnd,
+                        title: &win.info.title,
+                        hwnd: win.info.hwnd,
                         monitor: &shot.monitor,
                         ts,
-                        now: &now,
+                        now,
                     },
                     image,
                     origin,
+                    false,
                 )
                 .await?;
             if password_found {
-                // Geen tweede scherm van dit venster meer lezen.
-                break;
+                // Een wachtwoordveld in een achtergrondvenster zegt niets over
+                // de rest van het scherm; alleen dit venster is gevoelig.
+                self.segments.remove(&window_key(&app_key, &win.info.title));
             }
-        }
-
-        if self.ticks.is_multiple_of(FLUSH_EVERY) {
-            self.flush_boilerplate()?;
         }
         Ok(())
     }
@@ -492,21 +576,29 @@ impl Pipeline {
         ctx: FrameContext<'_>,
         image: RgbaImage,
         origin: (i32, i32),
+        foreground: bool,
     ) -> Result<bool> {
         let Some(hash) = self.check_frame_duplicate(&ctx, &image)? else {
             return Ok(false);
         };
 
         // Laag 3: lezen wat er staat — eerst de accessibility-boom, dan OCR.
-        // Bij meerdere monitoren wordt UIA bewust niet op een willekeurig
-        // scherm toegepast: het beschrijft alleen het voorgrondvenster.
-        let single_monitor = self.capturer.is_single_monitor();
-        let read = if single_monitor {
+        // UIA beschrijft één venster, dus voor het voorgrondvenster is het per
+        // definitie de juiste bron. Voor een venster op een ander scherm is het
+        // dat ook, maar een achtergrondboom kan traag zijn; de config bepaalt
+        // of we die prijs betalen of daar OCR lezen.
+        let read = if foreground || self.cfg.uia.secondary {
             self.read_text(ctx.app_key, ctx.hwnd, &image, origin).await
         } else {
-            self.read_ocr(&image, None, None, origin).await
+            self.read_ocr(
+                &image,
+                Some("uia uit voor achtergrondvensters".into()),
+                None,
+                origin,
+            )
+            .await
         };
-        self.process_frame_content(ctx, image, hash, read, single_monitor)
+        self.process_frame_content(ctx, image, hash, read, foreground)
     }
 
     /// Zelfde framepad als productie, met een tekstuitkomst die tests kunnen
@@ -517,12 +609,12 @@ impl Pipeline {
         ctx: FrameContext<'_>,
         image: RgbaImage,
         read: TextRead,
-        single_monitor: bool,
+        foreground: bool,
     ) -> Result<bool> {
         let Some(hash) = self.check_frame_duplicate(&ctx, &image)? else {
             return Ok(false);
         };
-        self.process_frame_content(ctx, image, hash, read, single_monitor)
+        self.process_frame_content(ctx, image, hash, read, foreground)
     }
 
     fn check_frame_duplicate(
@@ -531,7 +623,10 @@ impl Pipeline {
         image: &RgbaImage,
     ) -> Result<Option<u64>> {
         let hash = block_in_place(|| dedupe::dhash(image));
-        let scope = format!("{}@{}", ctx.app_key, ctx.monitor);
+        // Scope is één venster op één scherm: twee vensters van dezelfde app
+        // (twee Explorer-vensters, twee Chrome-vensters) mogen elkaars
+        // beeldhash en tekstgeheugen niet overschrijven.
+        let scope = frame_scope(ctx.app_key, ctx.monitor, ctx.hwnd);
         if self.filter.frame_is_duplicate(&scope, hash) {
             self.db.touch_segment(ctx.segment_id, ctx.ts)?;
             self.record_skip(&ctx.now.format("%Y-%m-%d").to_string(), "onveranderd beeld")?;
@@ -546,28 +641,26 @@ impl Pipeline {
         image: RgbaImage,
         hash: u64,
         read: TextRead,
-        single_monitor: bool,
+        foreground: bool,
     ) -> Result<bool> {
         let FrameContext {
             segment_id,
             app_key,
             title,
+            hwnd,
             monitor,
             ts,
             now,
-            ..
         } = ctx;
         let day = now.format("%Y-%m-%d").to_string();
-        let scope = format!("{app_key}@{monitor}");
+        let scope = frame_scope(app_key, monitor, hwnd);
         if read.password {
-            self.exclude_after_password(app_key, title, &day, segment_id)?;
+            self.exclude_after_password(app_key, title, &day, segment_id, foreground)?;
             return Ok(true);
         }
-        // De teksttoestand is per scherm wanneer we alle monitoren opnemen.
-        // Anders zou gelijke tekst op monitor 1 monitor 2 als herhaling
-        // wegdrukken voordat die tweede capture opgeslagen wordt.
-        let text_scope = if single_monitor { app_key } else { &scope };
-        let analysis = self.filter.analyze_text(text_scope, &read.lines);
+        // De teksttoestand is per venster op één scherm: gelijke tekst in een
+        // ander venster van dezelfde app is geen herhaling.
+        let analysis = self.filter.analyze_text(&scope, &read.lines);
 
         // Zelfde woorden als het vorige frame: er bewoog iets (een cursor, een
         // video in een hoek), maar inhoudelijk is er niets nieuws.
@@ -780,10 +873,16 @@ impl Pipeline {
 
     /// Is dit venster (of deze site) uitgesloten? Leert ook: meldt de extensie
     /// een wachtwoordveld, dan wordt het hele domein vanaf nu uitgesloten.
+    ///
+    /// `foreground` is false voor een venster op een ander scherm: de
+    /// browserbridge kent alleen het tabblad van het vóórgrondvenster, dus die
+    /// hostnaam toepassen op een achtergrondvenster zou het verkeerde domein
+    /// uitsluiten.
     fn excluded_reason(
         &mut self,
         window: &WindowInfo,
         app_key: &str,
+        foreground: bool,
     ) -> Result<Option<&'static str>> {
         if self.db.is_excluded("app", app_key)? {
             return Ok(Some("app uitgesloten"));
@@ -793,6 +892,9 @@ impl Pipeline {
             .is_excluded("window", &window_key(app_key, &window.title))?
         {
             return Ok(Some("venster uitgesloten"));
+        }
+        if !foreground {
+            return Ok(None);
         }
         if let Some((host, has_password_field)) = self.browser_report(app_key) {
             if self.db.is_excluded("domain", &host)? {
@@ -825,9 +927,12 @@ impl Pipeline {
         title: &str,
         day: &str,
         segment_id: i64,
+        foreground: bool,
     ) -> Result<()> {
         let now = Local::now().timestamp();
-        match self.browser_report(app_key) {
+        // Alleen het voorgrondvenster heeft een betrouwbare hostnaam van de
+        // extensie; een achtergrondvenster weten we niet welk domein het toont.
+        match self.browser_report(app_key).filter(|_| foreground) {
             Some((host, _)) => {
                 if self
                     .db
@@ -851,7 +956,7 @@ impl Pipeline {
         }
         self.record_skip(day, "wachtwoordveld")?;
         self.db.discard_segment_if_empty(segment_id)?;
-        self.segment = None;
+        self.segments.remove(&window_key(app_key, title));
         Ok(())
     }
 
@@ -873,21 +978,17 @@ impl Pipeline {
         Ok(id)
     }
 
-    /// Geeft het huidige segment, of opent een nieuw als je van app of venster
-    /// bent gewisseld.
+    /// Geeft het segment voor deze app en titel, of opent een nieuw segment.
+    /// Per venster, want een tweede scherm toont een ander venster dan het
+    /// eerste; hetzelfde venster houdt zijn segment zolang het in beeld is.
     fn segment_for(&mut self, app_id: i64, app_key: &str, title: &str, ts: i64) -> Result<i64> {
-        if let Some(seg) = &self.segment
-            && seg.app_key == app_key
-            && seg.title == title
-        {
+        let key = window_key(app_key, title);
+        if let Some(seg) = self.segments.get_mut(&key) {
+            seg.last_seen = ts;
             return Ok(seg.id);
         }
         let id = self.db.open_segment(app_id, title, ts)?;
-        self.segment = Some(Segment {
-            id,
-            app_key: app_key.to_string(),
-            title: title.to_string(),
-        });
+        self.segments.insert(key, Segment { id, last_seen: ts });
         Ok(id)
     }
 
@@ -914,6 +1015,91 @@ impl Pipeline {
 
 fn window_key(app_key: &str, title: &str) -> String {
     format!("{app_key}::{title}")
+}
+
+/// Scope voor beeld- en tekstgeheugen: één venster op één scherm.
+fn frame_scope(app_key: &str, monitor: &str, hwnd: isize) -> String {
+    format!("{app_key}@{monitor}#{hwnd}")
+}
+
+fn overlaps(a: Rect, b: Rect) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+/// Snijdt een schermshot bij tot het voorgrondvenster en geeft de oorsprong
+/// van dat beeld terug, in dezelfde ruimte als de vensterrechthoek.
+///
+/// Zonder geometrie (DWM weigert) gebruiken we liever de hele shot dan de
+/// capture over te slaan.
+fn lead_frame(shot: &Shot, win_rect: Option<Rect>) -> Option<(RgbaImage, (i32, i32))> {
+    match win_rect {
+        Some(rect) => crop_to_window(&shot.image, shot.x, shot.y, rect)
+            .map(|image| (image, (rect.left.max(shot.x), rect.top.max(shot.y)))),
+        None => Some((shot.image.clone(), (shot.x, shot.y))),
+    }
+}
+
+/// Geschat aantal pixels van `rect` dat op dit scherm zichtbaar is: het
+/// snijvlak met `screen`, minus de vensters die er in z-order bovenop staan.
+///
+/// Een raster van 24×24 monsters onderscheidt "bijna helemaal bedekt" van
+/// "grotendeels zichtbaar" en is veel goedkoper dan een echte oppervlakte-unie
+/// van willekeurig veel rechthoeken.
+fn visible_area(rect: Rect, screen: Rect, occluders: &[Rect]) -> u64 {
+    const STEPS: i64 = 24;
+
+    let left = rect.left.max(screen.left);
+    let top = rect.top.max(screen.top);
+    let right = rect.right.min(screen.right);
+    let bottom = rect.bottom.min(screen.bottom);
+    let (w, h) = ((right - left) as i64, (bottom - top) as i64);
+    if w <= 0 || h <= 0 {
+        return 0;
+    }
+
+    let mut free = 0i64;
+    for gy in 0..STEPS {
+        let y = top as i64 + h * (2 * gy + 1) / (2 * STEPS);
+        for gx in 0..STEPS {
+            let x = left as i64 + w * (2 * gx + 1) / (2 * STEPS);
+            let covered = occluders.iter().any(|o| {
+                x >= o.left as i64 && x < o.right as i64 && y >= o.top as i64 && y < o.bottom as i64
+            });
+            if !covered {
+                free += 1;
+            }
+        }
+    }
+
+    (w as u64) * (h as u64) * free as u64 / (STEPS * STEPS) as u64
+}
+
+/// Wist de stukken van een bijgesneden beeld waar een ander venster bovenop
+/// staat. `origin` is de oorsprong van het beeld in schermpixels. Zonder dit
+/// zou de inhoud van de bovenbuur aan dit venster toegeschreven worden.
+fn mask_rects(image: &mut RgbaImage, origin: (i32, i32), rects: &[Rect]) -> usize {
+    let (w, h) = (image.width() as i32, image.height() as i32);
+    let mut masked = 0;
+    for r in rects {
+        let left = (r.left - origin.0).max(0);
+        let top = (r.top - origin.1).max(0);
+        let right = (r.right - origin.0).min(w);
+        let bottom = (r.bottom - origin.1).min(h);
+        if right <= left || bottom <= top {
+            continue;
+        }
+        fill_white(image, left, top, right, bottom);
+        masked += 1;
+    }
+    masked
+}
+
+fn fill_white(image: &mut RgbaImage, left: i32, top: i32, right: i32, bottom: i32) {
+    for y in top..bottom {
+        for x in left..right {
+            image.put_pixel(x as u32, y as u32, Rgba([255, 255, 255, 255]));
+        }
+    }
 }
 
 /// Verbergt de favorietenbalk van een Chromium-browser in het OCR-beeld.
@@ -949,11 +1135,7 @@ fn mask_bookmark_bar(image: &mut RgbaImage, bar: Rect, origin: (i32, i32)) -> bo
         return false;
     }
 
-    for y in top..bottom {
-        for x in left..right {
-            image.put_pixel(x as u32, y as u32, Rgba([255, 255, 255, 255]));
-        }
-    }
+    fill_white(image, left, top, right, bottom);
     true
 }
 
@@ -1306,5 +1488,93 @@ mod tests {
         // Volledig buiten het beeld.
         let mut img = RgbaImage::from_pixel(200, 200, Rgba([10, 20, 30, 255]));
         assert!(!mask_bookmark_bar(&mut img, rect(0, 300, 200, 334), (0, 0)));
+    }
+
+    #[test]
+    fn zichtbaar_oppervlak_trekt_bedekkers_eraf() {
+        let screen = rect(0, 0, 1000, 1000);
+        let window = rect(100, 100, 600, 600);
+
+        assert_eq!(visible_area(window, screen, &[]), 250_000);
+        // De rechterhelft ligt onder een ander venster.
+        assert_eq!(
+            visible_area(window, screen, &[rect(350, 100, 900, 600)]),
+            125_000
+        );
+        // Volledig bedekt telt als niets.
+        assert_eq!(visible_area(window, screen, &[rect(0, 0, 1000, 1000)]), 0);
+        // Wat buiten dit scherm valt telt niet mee.
+        assert_eq!(visible_area(rect(-500, 0, 500, 500), screen, &[]), 250_000);
+        // Een venster dat dit scherm niet raakt is nergens zichtbaar.
+        assert_eq!(visible_area(rect(2000, 0, 2500, 500), screen, &[]), 0);
+    }
+
+    #[test]
+    fn masker_wist_alleen_wat_er_bovenop_staat() {
+        let mut img = image(100, 100);
+        let masked = mask_rects(
+            &mut img,
+            (50, 50),
+            &[rect(60, 60, 80, 80), rect(1000, 1000, 1100, 1100)],
+        );
+
+        assert_eq!(masked, 1, "een bedekker buiten het beeld raakt niets");
+        assert_eq!(img.get_pixel(9, 9).0, [1, 2, 3, 255]);
+        assert_eq!(img.get_pixel(10, 10).0, [255, 255, 255, 255]);
+        assert_eq!(img.get_pixel(29, 29).0, [255, 255, 255, 255]);
+        assert_eq!(img.get_pixel(30, 30).0, [1, 2, 3, 255]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn twee_vensters_van_dezelfde_app_delen_geen_beeldhash() {
+        // Twee Explorer-vensters naast elkaar tonen vaak hetzelfde beeld. Zonder
+        // venster in de scope zou het tweede als "onveranderd" wegvallen.
+        let (mut pipeline, db, _, _temp, segment_id) = pipeline_fixture(Config::default());
+        let now = Local::now();
+        let lines = ["Dezelfde inhoud in twee losse vensters van dezelfde app"];
+
+        let mut first = frame_context(&now, segment_id);
+        first.hwnd = 1;
+        pipeline
+            .process_frame_with_read(first, patterned_image(false), uia_read(&lines), false)
+            .unwrap();
+
+        let mut second = frame_context(&now, segment_id);
+        second.hwnd = 2;
+        pipeline
+            .process_frame_with_read(second, patterned_image(false), uia_read(&lines), false)
+            .unwrap();
+
+        assert_eq!(db.stats(0, i64::MAX).unwrap().captures, 2);
+    }
+
+    #[test]
+    fn elk_venster_houdt_zijn_eigen_segment() {
+        let (mut pipeline, db, _, _temp, _segment_id) = pipeline_fixture(Config::default());
+        let app_id = db.app_id("test-app", "test.exe", "C:\\test.exe").unwrap();
+
+        let first = pipeline
+            .segment_for(app_id, "test-app", "Venster A", 100)
+            .unwrap();
+        let second = pipeline
+            .segment_for(app_id, "test-app", "Venster B", 100)
+            .unwrap();
+        assert_ne!(first, second, "elk venster opent zijn eigen segment");
+        assert_eq!(
+            pipeline
+                .segment_for(app_id, "test-app", "Venster A", 101)
+                .unwrap(),
+            first,
+            "hetzelfde venster houdt zijn segment zolang het in beeld is"
+        );
+
+        // Een tik waarin dit venster niet meer voorkwam sluit het segment.
+        pipeline.segments.retain(|_, seg| seg.last_seen >= 200);
+        assert_ne!(
+            pipeline
+                .segment_for(app_id, "test-app", "Venster A", 200)
+                .unwrap(),
+            first
+        );
     }
 }

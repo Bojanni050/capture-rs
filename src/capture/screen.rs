@@ -9,6 +9,8 @@ use anyhow::{Context, Result, anyhow};
 use image::RgbaImage;
 use xcap::Monitor;
 
+use crate::capture::Rect;
+
 pub struct ScreenCapturer {
     selector: MonitorSelector,
     monitors: Vec<Monitor>,
@@ -29,6 +31,19 @@ pub struct Shot {
     /// pixelcoördinaten binnen dít beeld.
     pub x: i32,
     pub y: i32,
+}
+
+impl Shot {
+    /// Dit scherm als rechthoek in virtuele-schermcoördinaten, dezelfde ruimte
+    /// als vensterrechthoeken.
+    pub fn rect(&self) -> Rect {
+        Rect {
+            left: self.x,
+            top: self.y,
+            right: self.x + self.image.width() as i32,
+            bottom: self.y + self.image.height() as i32,
+        }
+    }
 }
 
 impl ScreenCapturer {
@@ -75,13 +90,6 @@ impl ScreenCapturer {
             .map(|m| m.friendly_name().unwrap_or_else(|_| "?".into()))
             .collect();
         names.join(", ")
-    }
-
-    /// Of de huidige selectie precies één scherm bevat. De pipeline gebruikt
-    /// dit om te bepalen of UIA veilig als tekstbron voor een frame kan dienen:
-    /// UIA beschrijft alleen het voorgrondvenster, niet een tweede monitor.
-    pub fn is_single_monitor(&self) -> bool {
-        self.selected().len() == 1
     }
 
     fn selected(&self) -> Vec<&Monitor> {

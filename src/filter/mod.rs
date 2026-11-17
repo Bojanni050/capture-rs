@@ -166,6 +166,16 @@ impl NoiseFilter {
         Gate::Proceed
     }
 
+    /// Mag dit venster als bron dienen? Dezelfde regels als de poort, zonder de
+    /// idle-vraag: die gaat over de gebruiker, niet over één venster. Gebruikt
+    /// voor vensters op een ander scherm dan dat van het voorgrondvenster.
+    pub fn window_allowed(&self, window: &WindowInfo) -> bool {
+        let app_key = window.app_key();
+        !app_key.trim().is_empty()
+            && !self.denylist.blocks_app(&app_key)
+            && !self.denylist.blocks_title(&window.title)
+    }
+
     /// Laag 2: is dit frame perceptueel gelijk aan het vorige op dit scherm?
     ///
     /// `scope` moet app én monitor omvatten. Werkt de opgeslagen hash bij, dus
@@ -301,7 +311,10 @@ mod tests {
     #[test]
     fn gewone_app_mag_door() {
         let f = filter();
-        assert_eq!(f.gate(Some(&window("code.exe", "main.rs")), 0, 90), Gate::Proceed);
+        assert_eq!(
+            f.gate(Some(&window("code.exe", "main.rs")), 0, 90),
+            Gate::Proceed
+        );
     }
 
     #[test]
